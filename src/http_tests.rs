@@ -830,3 +830,26 @@ async fn upload_page_keeps_token_per_tab_on_unsandboxed_single_host() {
     .await;
     assert!(single_unsandboxed.contains("\"persistToken\":false"));
 }
+
+#[tokio::test]
+async fn mcp_storage_errors_are_generic() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let app = app(state_with(tmp.path(), |_| {}));
+    std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+    if std::fs::create_dir(tmp.path().join("root-check")).is_ok() {
+        return; // running as root: permissions aren't enforced
+    }
+    let mut c = Mcp::new(&app, &[]);
+    c.init().await;
+    let r = c
+        .call(
+            "create_share",
+            json!({"files": [{"path": "a.txt", "text": "x"}]}),
+        )
+        .await;
+    std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let text = r.to_string();
+    assert!(text.contains("failed on the server"), "{r}");
+    assert!(!text.contains("os error"), "{r}");
+}

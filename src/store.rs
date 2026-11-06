@@ -363,9 +363,16 @@ pub struct Store {
 }
 
 impl Store {
+    /// Opens (creates) the data directory and checks it is writable, so a
+    /// wrong owner fails at startup instead of on the first upload.
     pub fn new(root: impl Into<PathBuf>) -> io::Result<Self> {
         let root = root.into();
         fs::create_dir_all(&root)?;
+        // Same operations as an upload: a staging dir with a file in it.
+        let probe = root.join(format!("{TMP_PREFIX}probe-{}", random_token()));
+        let res = fs::create_dir(&probe).and_then(|()| fs::write(probe.join("w"), b""));
+        let _ = fs::remove_dir_all(&probe);
+        res?;
         Ok(Self { root })
     }
 
@@ -682,6 +689,30 @@ mod tests {
         data.extend_from_slice(b"PK\x01\x02tail");
         fs::write(&p, &data).unwrap();
         assert_eq!(count_central_headers(&p, usize::MAX).unwrap(), 1);
+    }
+
+    #[test]
+    fn unwritable_data_dir_fails_at_open() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().join("data");
+        fs::create_dir(&d).unwrap();
+        fs::set_permissions(&d, fs::Permissions::from_mode(0o555)).unwrap();
+        // root ignores permissions (e.g. tests in a root container): skip
+        let root = fs::write(d.join("x"), b"").is_ok();
+        if !root {
+            let e = Store::new(&d).err().expect("must fail");
+            assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
+        }
+        fs::set_permissions(&d, fs::Permissions::from_mode(0o755)).unwrap();
+        Store::new(&d).unwrap();
+        assert_eq!(
+            fs::read_dir(&d)
+                .unwrap()
+                .filter(|e| e.as_ref().unwrap().file_name() != "x")
+                .count(),
+            0
+        );
     }
 
     #[test]

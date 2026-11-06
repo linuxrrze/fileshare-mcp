@@ -116,6 +116,13 @@ fn err(msg: impl Into<String>) -> ErrorData {
     ErrorData::invalid_params(msg.into(), None)
 }
 
+/// Server-side failure: details go to the log, the client gets a generic
+/// message (like the HTTP API's "storage error").
+fn internal(what: &str, e: impl std::fmt::Display) -> ErrorData {
+    tracing::error!("mcp {what}: {e}");
+    ErrorData::internal_error(format!("{what} failed on the server (see its log)"), None)
+}
+
 fn json_result(v: serde_json::Value) -> CallToolResult {
     CallToolResult::success(vec![ContentBlock::text(
         serde_json::to_string_pretty(&v).unwrap_or_default(),
@@ -187,9 +194,9 @@ Content passes through your context: use the HTTP API (curl) for large files."
             store.commit(st, ttl)
         })
         .await
-        .map_err(|e| ErrorData::internal_error(e.to_string(), None))?
+        .map_err(|e| internal("create_share", e))?
         .map_err(|e| match e {
-            UploadError::Io(io) => ErrorData::internal_error(io.to_string(), None),
+            UploadError::Io(io) => internal("create_share storage", io),
             other => err(other.to_string()),
         })?;
         tracing::info!(token = %&created.token[..6], files = created.files.len(), "share created via MCP");
@@ -257,7 +264,7 @@ content, anything else as a base64 resource. Size-capped by the server (MCP_MAX_
         }
         let data = tokio::fs::read(self.state.store.file_path(&token, &rel))
             .await
-            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+            .map_err(|e| internal("read_file", e))?;
         let mime = entry
             .mime
             .split(';')

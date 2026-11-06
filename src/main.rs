@@ -155,6 +155,20 @@ fn secret(v: Option<String>, name: &str) -> Result<Option<String>, String> {
     }
 }
 
+/// `uid 1000, gid 1000` of this process (from /proc; no libc dependency).
+fn process_ids() -> String {
+    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    let field = |name: &str| {
+        status
+            .lines()
+            .find_map(|l| l.strip_prefix(name))
+            .and_then(|v| v.split_whitespace().nth(1)) // effective id
+            .unwrap_or("?")
+            .to_string()
+    };
+    format!("uid {}, gid {}", field("Uid:"), field("Gid:"))
+}
+
 /// `https://Host.Example:8443/x` -> `host.example:8443`
 pub fn url_authority(url: &str) -> Option<String> {
     let rest = url
@@ -301,6 +315,13 @@ async fn main() {
     };
     let store = Store::new(&cfg.data_dir).unwrap_or_else(|e| {
         eprintln!("fileshare: cannot use DATA_DIR {}: {e}", cfg.data_dir);
+        if e.kind() == std::io::ErrorKind::PermissionDenied {
+            let uid = process_ids();
+            eprintln!(
+                "fileshare: DATA_DIR must be writable by {uid}; for a bind mount run \
+                 e.g. `sudo chown -R 1000:1000 <host dir>` on the host"
+            );
+        }
         std::process::exit(1);
     });
     if !cfg.split_hosts() {
