@@ -1,0 +1,36 @@
+# fileshare: anonymous, expiring file shares behind unguessable URLs, with an
+# MCP endpoint for agents.
+#   cp docker-compose.yml.sample docker-compose.yml
+#   cp .env.sample .env        # set PUBLIC_URL / CONTENT_URL (+ optional tokens)
+#   mkdir -p fs/data && sudo chown 1000:1000 fs/data
+#   docker compose up -d
+#
+# Put a TLS reverse proxy in front for BOTH hostnames (PUBLIC_URL and
+# CONTENT_URL), forwarding the original Host header, with no body size limit
+# and request buffering off -- see README "Reverse proxy".
+
+services:
+  fileshare:
+    image: git.linux-ng.de/marcel/fileshare:latest
+    container_name: fileshare
+    restart: unless-stopped
+    # .env must exist locally: cp .env.sample .env
+    env_file: .env
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+      # Shares (one directory per share, removed on expiry). Owned by 1000.
+      - ./fs/data:/data
+    # Only the reverse proxy should reach it; bind to localhost (or drop
+    # `ports:` and put the proxy on a shared network instead).
+    ports:
+      - "127.0.0.1:8080:8080"
+    # Uncomment to let containers on codingenv's network use
+    # http://fileshare:8080/mcp (keep MCP_ALLOWED_HOSTS=fileshare in .env).
+    # networks:
+    #   - default
+    #   - codingenv
+
+# networks:
+#   codingenv:
+#     external: true
+#     name: ${CODINGENV_NETWORK:-codingenv_default}

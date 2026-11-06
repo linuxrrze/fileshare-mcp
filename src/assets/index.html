@@ -1,0 +1,164 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>fileshare</title>
+<style>
+:root{color-scheme:light dark;--fg:#1d1d1f;--bg:#f5f5f7;--card:#fff;--muted:#6e6e73;--line:#d2d2d7;--accent:#0b63c5;--accent-fg:#fff;--ok:#1a7f37;--err:#c62828}
+@media (prefers-color-scheme:dark){:root{--fg:#f5f5f7;--bg:#111113;--card:#1c1c1e;--muted:#a1a1a6;--line:#3a3a3c;--accent:#4c9dff;--accent-fg:#06121f;--ok:#4cc26a;--err:#ff6b6b}}
+*{box-sizing:border-box}
+body{margin:0;font:15px/1.5 system-ui,-apple-system,sans-serif;color:var(--fg);background:var(--bg)}
+main{max-width:640px;margin:0 auto;padding:32px 16px}
+h1{font-size:22px;margin:0 0 4px}
+.sub{color:var(--muted);margin:0 0 24px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:20px}
+#drop{border:2px dashed var(--line);border-radius:10px;padding:28px 12px;text-align:center;cursor:pointer;transition:border-color .15s,background .15s}
+#drop.over{border-color:var(--accent);background:color-mix(in srgb,var(--accent) 8%,transparent)}
+#drop strong{display:block;font-size:16px}
+#drop span{color:var(--muted);font-size:13px}
+.row{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-top:16px}
+label{font-size:14px;color:var(--muted)}
+select,input[type=password]{font:inherit;color:var(--fg);background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:6px 8px}
+button{font:inherit;border:0;border-radius:8px;padding:8px 16px;background:var(--accent);color:var(--accent-fg);cursor:pointer;font-weight:600}
+button.ghost{background:transparent;color:var(--accent);border:1px solid var(--line);font-weight:500}
+button:disabled{opacity:.5;cursor:default}
+#list{margin:12px 0 0;padding:0;list-style:none;font-size:14px;max-height:180px;overflow:auto}
+#list li{display:flex;justify-content:space-between;gap:8px;padding:3px 0;border-bottom:1px solid var(--line);word-break:break-all}
+#list li span:last-child{color:var(--muted);white-space:nowrap}
+progress{width:100%;margin-top:14px;display:none}
+#result{display:none;margin-top:20px}
+#result input{width:100%;font:inherit;padding:8px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--fg)}
+.msg{margin-top:12px;font-size:14px}
+.msg.err{color:var(--err)}.msg.ok{color:var(--ok)}
+.small{font-size:13px;color:var(--muted)}
+.hidden{display:none}
+</style>
+</head>
+<body>
+<main>
+<h1>fileshare</h1>
+<p class="sub">Share files through a secret link that expires.</p>
+<div class="card">
+  <div id="drop" tabindex="0" role="button" aria-label="Choose files">
+    <strong>Drop files or a folder here</strong>
+    <span>or click to choose files &middot; a single .zip is unpacked (good for HTML pages with images)</span>
+  </div>
+  <input id="files" type="file" multiple hidden>
+  <input id="folder" type="file" webkitdirectory hidden>
+  <ul id="list"></ul>
+  <div class="row">
+    <label for="expires">Expires after</label>
+    <select id="expires"></select>
+    <button class="ghost" id="pickFolder" type="button">Choose folder&hellip;</button>
+  </div>
+  <div class="row hidden" id="tokenRow">
+    <label for="token">Upload token</label>
+    <input id="token" type="password" autocomplete="current-password">
+  </div>
+  <div class="row"><button id="go" disabled>Upload</button><span class="small" id="total"></span></div>
+  <progress id="prog" max="100" value="0"></progress>
+  <div id="msg" class="msg"></div>
+  <div id="result">
+    <label for="url">Share link</label>
+    <div class="row" style="margin-top:4px;flex-wrap:nowrap"><input id="url" readonly><button id="copy" type="button">Copy</button></div>
+    <p class="small" id="expiry"></p>
+    <div class="row"><button class="ghost" id="del" type="button">Delete now</button><a class="small" id="open" target="_blank" rel="noopener noreferrer">Open</a></div>
+  </div>
+</div>
+<p class="small" id="foot"></p>
+</main>
+<script>
+const CONF = /*CONFIG*/{};
+const $ = id => document.getElementById(id);
+let picked = []; // [{file, path}]
+let last = null;
+
+const human = n => { const u=['B','KiB','MiB','GiB','TiB']; let i=0; while(n>=1024&&i<u.length-1){n/=1024;i++} return (i?n.toFixed(1):n)+' '+u[i]; };
+$('foot').textContent = `fileshare ${CONF.version || ''} · max ${human(CONF.maxUpload||0)} per upload`;
+
+const choices = [['1h',3600],['24h',86400],['7d',604800],['30d',2592000],['90d',7776000]];
+for (const [label, secs] of choices) {
+  if (secs > (CONF.maxExpiry || 0)) continue;
+  const o = new Option(label, label); if (secs === CONF.defaultExpiry) o.selected = true; $('expires').add(o);
+}
+if (!$('expires').options.length) $('expires').add(new Option('default', ''));
+
+if (CONF.tokenRequired) {
+  $('tokenRow').classList.remove('hidden');
+  try { $('token').value = localStorage.getItem('fileshare-token') || ''; } catch {}
+}
+
+function render() {
+  $('list').replaceChildren(...picked.map(p => { const li=document.createElement('li'); li.append(Object.assign(document.createElement('span'),{textContent:p.path}),Object.assign(document.createElement('span'),{textContent:human(p.file.size)})); return li; }));
+  const total = picked.reduce((a,p)=>a+p.file.size,0);
+  $('total').textContent = picked.length ? `${picked.length} file(s), ${human(total)}` : '';
+  $('go').disabled = !picked.length;
+}
+function addFiles(list, useRelative) {
+  for (const f of list) picked.push({file:f, path:(useRelative && f.webkitRelativePath) || f.name});
+  render();
+}
+async function walk(entry, prefix, out) {
+  if (entry.isFile) { out.push(await new Promise((res,rej)=>entry.file(f=>res({file:f,path:prefix+f.name}),rej))); return; }
+  const reader = entry.createReader(); let batch;
+  do { batch = await new Promise((res,rej)=>reader.readEntries(res,rej)); for (const e of batch) await walk(e, prefix+entry.name+'/', out); } while (batch.length);
+}
+$('drop').onclick = () => $('files').click();
+$('drop').onkeydown = e => { if (e.key==='Enter'||e.key===' ') { e.preventDefault(); $('files').click(); } };
+$('pickFolder').onclick = () => $('folder').click();
+$('files').onchange = e => addFiles(e.target.files, false);
+$('folder').onchange = e => addFiles(e.target.files, true);
+['dragenter','dragover'].forEach(t => $('drop').addEventListener(t, e => { e.preventDefault(); $('drop').classList.add('over'); }));
+['dragleave','drop'].forEach(t => $('drop').addEventListener(t, () => $('drop').classList.remove('over')));
+$('drop').addEventListener('drop', async e => {
+  e.preventDefault();
+  const items = [...(e.dataTransfer.items||[])].map(i => i.webkitGetAsEntry && i.webkitGetAsEntry()).filter(Boolean);
+  if (items.length) {
+    const out = [];
+    for (const it of items) await walk(it, '', out);
+    // a single dropped folder becomes the share root
+    const tops = new Set(out.map(o => o.path.split('/')[0]));
+    if (items.length === 1 && items[0].isDirectory && tops.size === 1) out.forEach(o => o.path = o.path.slice(o.path.indexOf('/')+1));
+    picked.push(...out); render();
+  } else addFiles(e.dataTransfer.files, false);
+});
+
+function msg(text, cls) { $('msg').textContent = text; $('msg').className = 'msg ' + (cls||''); }
+
+$('go').onclick = () => {
+  const fd = new FormData();
+  fd.append('expires', $('expires').value);
+  for (const p of picked) fd.append('file', p.file, p.path);
+  const xhr = new XMLHttpRequest();
+  xhr.open('POST', 'api/upload');
+  if (CONF.tokenRequired) {
+    const t = $('token').value.trim();
+    try { localStorage.setItem('fileshare-token', t); } catch {}
+    xhr.setRequestHeader('Authorization', 'Bearer ' + t);
+  }
+  $('prog').style.display = 'block'; $('prog').value = 0; $('go').disabled = true; msg('Uploading…');
+  xhr.upload.onprogress = e => { if (e.lengthComputable) $('prog').value = 100*e.loaded/e.total; };
+  xhr.onload = () => {
+    $('prog').style.display = 'none';
+    if (xhr.status === 201) {
+      last = JSON.parse(xhr.responseText);
+      $('url').value = last.url; $('open').href = last.url;
+      $('expiry').textContent = `Expires ${new Date(last.expires_at_unix*1000).toLocaleString()}. Anyone with the link can open it.`;
+      $('result').style.display = 'block'; msg('Uploaded.', 'ok');
+      picked = []; render();
+    } else { msg(`Upload failed (${xhr.status}): ${xhr.responseText.trim()}`, 'err'); $('go').disabled = false; }
+  };
+  xhr.onerror = () => { $('prog').style.display='none'; msg('Upload failed: network error', 'err'); $('go').disabled = false; };
+  xhr.send(fd);
+};
+$('copy').onclick = async () => { try { await navigator.clipboard.writeText($('url').value); msg('Link copied.', 'ok'); } catch { $('url').select(); } };
+$('del').onclick = async () => {
+  if (!last) return;
+  const r = await fetch(`api/share/${last.token}`, {method:'DELETE', headers:{'X-Delete-Token': last.delete_token}});
+  if (r.ok) { $('result').style.display='none'; msg('Deleted.', 'ok'); last = null; } else msg(`Delete failed (${r.status})`, 'err');
+};
+</script>
+</body>
+</html>

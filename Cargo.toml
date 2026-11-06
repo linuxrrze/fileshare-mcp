@@ -1,0 +1,33 @@
+[package]
+name = "fileshare"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+axum = { version = "0.8.9", features = ["multipart"] }
+base64 = "0.22"
+data-encoding = "2.11.1"
+futures-util = { version = "0.3.34", default-features = false }
+humantime = "2.4.0"
+mime_guess = "2.0.5"
+percent-encoding = "2.3.2"
+rand = "0.10.3"
+rmcp = { version = "3.9.0", features = ["server", "transport-streamable-http-server", "macros"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.11.1"
+tokio = { version = "1.54.1", features = ["full"] }
+tower = { version = "0.5.3", features = ["util"] }
+tower-http = { version = "0.7.1", features = ["fs", "limit", "trace"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+zip = { version = "9.4.1", default-features = false, features = ["deflate"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
