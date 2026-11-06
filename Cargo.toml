@@ -1,15 +1,17 @@
 [package]
 name = "fileshare"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 
 [dependencies]
-axum = { version = "0.8.9", features = ["multipart"] }
+axum = "0.8.9"
 base64 = "0.22"
 data-encoding = "2.11.1"
 futures-util = { version = "0.3.34", default-features = false }
 humantime = "2.4.0"
+memchr = "2.8.3"
 mime_guess = "2.0.5"
+multer = "3.1.0"
 percent-encoding = "2.3.2"
 rand = "0.10.3"
 rmcp = { version = "3.9.0", features = ["server", "transport-streamable-http-server", "macros"] }

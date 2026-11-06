@@ -85,9 +85,13 @@ for (const [label, secs] of choices) {
 }
 if (!$('expires').options.length) $('expires').add(new Option('default', ''));
 
+function tokenStore() { return CONF.persistToken ? localStorage : sessionStorage; }
 if (CONF.tokenRequired) {
+  if (!CONF.persistToken) try { localStorage.removeItem('fileshare-token'); } catch {}
   $('tokenRow').classList.remove('hidden');
-  try { $('token').value = localStorage.getItem('fileshare-token') || ''; } catch {}
+  // Single host without sandbox: shared pages run on this origin, so keep
+  // the token for this tab only (sessionStorage) instead of persistently.
+  try { $('token').value = tokenStore().getItem('fileshare-token') || ''; } catch {}
 }
 
 function render() {
@@ -135,7 +139,7 @@ $('go').onclick = () => {
   xhr.open('POST', 'api/upload');
   if (CONF.tokenRequired) {
     const t = $('token').value.trim();
-    try { localStorage.setItem('fileshare-token', t); } catch {}
+    try { tokenStore().setItem('fileshare-token', t); } catch {}
     xhr.setRequestHeader('Authorization', 'Bearer ' + t);
   }
   $('prog').style.display = 'block'; $('prog').value = 0; $('go').disabled = true; msg('Uploading…');

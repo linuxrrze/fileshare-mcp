@@ -1,7 +1,7 @@
 //! HTTP-level tests: requests go through the full router (Host routing,
 //! upload API, content serving, MCP incl. auth) without opening a socket.
 
-use std::{sync::Arc, time::Duration};
+use std::time::Duration;
 
 use axum::{
     Router,
@@ -28,7 +28,10 @@ pub fn state_with(dir: &std::path::Path, tweak: impl FnOnce(&mut Config)) -> Sha
         default_expiry: Duration::from_secs(3600),
         max_expiry: Duration::from_secs(86400),
         max_upload: 1 << 20,
-        max_zip_entries: 100,
+        max_files: 100,
+        upload_idle_timeout: Duration::from_secs(5),
+        max_concurrent_uploads: 4,
+        content_sandbox: true,
         upload_token: None,
         mcp_api_key: None,
         mcp_allowed_hosts: vec![],
@@ -37,10 +40,7 @@ pub fn state_with(dir: &std::path::Path, tweak: impl FnOnce(&mut Config)) -> Sha
         sweep_interval: Duration::from_secs(60),
     };
     tweak(&mut cfg);
-    Arc::new(AppState {
-        store: Store::new(dir).unwrap(),
-        cfg,
-    })
+    AppState::new(cfg, Store::new(dir).unwrap())
 }
 
 async fn send(app: &Router, req: Request<Body>) -> Response {
@@ -132,7 +132,7 @@ fn put(name: &str, query: &str, data: &[u8]) -> Request<Body> {
 async fn host_routing() {
     let tmp = tempfile::tempdir().unwrap();
     let st = state_with(tmp.path(), |_| {});
-    let mut stg = st.store.begin(100).unwrap();
+    let mut stg = st.store.begin(100, 10).unwrap();
     stg.put_bytes("index.html", b"<h1>x</h1>").unwrap();
     let c = st.store.commit(stg, Duration::from_secs(60)).unwrap();
     let app = app(st);
@@ -600,4 +600,233 @@ async fn mcp_upload_refused_when_upload_token_but_no_mcp_key() {
         r.get("error").is_some() || r["result"]["isError"] == true,
         "{r}"
     );
+}
+
+// ------------------------------------------------- resource limits (DoS)
+
+fn staging_dirs(dir: &std::path::Path) -> usize {
+    std::fs::read_dir(dir)
+        .unwrap()
+        .filter(|e| {
+            e.as_ref()
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".tmp-")
+        })
+        .count()
+}
+
+fn post_raw_multipart(body: Body) -> Request<Body> {
+    Request::post("/api/upload")
+        .header(header::HOST, APP)
+        .header(
+            header::CONTENT_TYPE,
+            format!("multipart/form-data; boundary={BOUNDARY}"),
+        )
+        .body(body)
+        .unwrap()
+}
+
+#[tokio::test]
+async fn multipart_text_fields_and_part_headers_are_bounded() {
+    let tmp = tempfile::tempdir().unwrap();
+    let app = app(state_with(tmp.path(), |_| {}));
+
+    // `expires` used to be read into memory without any limit
+    let huge = vec![b'9'; 64 * 1024];
+    let r = send(
+        &app,
+        post_multipart(
+            multipart(&[("expires", None, &huge), ("file", Some("a.txt"), b"x")]),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+    assert!(body_string(r).await.contains("too large"));
+
+    // unknown fields are capped the same way
+    let r = send(
+        &app,
+        post_multipart(multipart(&[("junk", None, &huge)]), None),
+    )
+    .await;
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+
+    // a part header block that never ends is cut off early
+    let mut raw = format!(
+        "--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a\"\r\nX-Pad: "
+    )
+    .into_bytes();
+    raw.extend(std::iter::repeat_n(b'h', 100_000));
+    let r = send(&app, post_raw_multipart(Body::from(raw))).await;
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+    assert!(body_string(r).await.contains("part headers exceed"));
+
+    // not multipart at all
+    let r = send(
+        &app,
+        Request::post("/api/upload")
+            .header(header::HOST, APP)
+            .body(Body::from("x"))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(staging_dirs(tmp.path()), 0);
+}
+
+#[tokio::test]
+async fn file_count_is_capped_on_every_upload_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    let app = app(state_with(tmp.path(), |c| c.max_files = 3));
+
+    // multipart: 4 empty files
+    let names = ["a", "b", "c", "d"];
+    let parts: Vec<_> = names.iter().map(|n| ("file", Some(*n), &b""[..])).collect();
+    let r = send(&app, post_multipart(multipart(&parts), None)).await;
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+    assert!(body_string(r).await.contains("too many files"));
+    let r = send(&app, post_multipart(multipart(&parts[..3]), None)).await;
+    assert_eq!(r.status(), StatusCode::CREATED);
+
+    // zip: more central-directory entries than 2 * max_files is refused
+    // before the archive is parsed; 4 files (<= 6 entries) hit the file cap
+    let many: Vec<(String, Vec<u8>)> = (0..7).map(|i| (format!("f{i}"), vec![])).collect();
+    let refs: Vec<(&str, &[u8])> = many
+        .iter()
+        .map(|(n, d)| (n.as_str(), d.as_slice()))
+        .collect();
+    let r = send(&app, put("many.zip", "", &zip_bytes(&refs))).await;
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+    assert!(body_string(r).await.contains("more than 6 entries"));
+    let r = send(&app, put("four.zip", "", &zip_bytes(&refs[..4]))).await;
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+    assert!(body_string(r).await.contains("too many files"));
+
+    // MCP
+    let mut c = Mcp::new(&app, &[]);
+    c.init().await;
+    let files: Vec<Value> = names
+        .iter()
+        .map(|n| json!({"path": n, "text": ""}))
+        .collect();
+    let r = c.call("create_share", json!({ "files": files })).await;
+    assert!(
+        r.get("error").is_some() || r["result"]["isError"] == true,
+        "{r}"
+    );
+    assert_eq!(staging_dirs(tmp.path()), 0);
+}
+
+#[tokio::test]
+async fn stalled_upload_times_out() {
+    let tmp = tempfile::tempdir().unwrap();
+    let app = app(state_with(tmp.path(), |c| {
+        c.upload_idle_timeout = Duration::from_millis(200)
+    }));
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(1);
+    tx.send(Ok("first bytes".into())).await.unwrap();
+    let body = Body::from_stream(tokio_stream_from(rx));
+    let r = tokio::time::timeout(
+        Duration::from_secs(5),
+        send(&app, put("slow.bin", "", b"").map_body(body)),
+    )
+    .await
+    .expect("upload must not hang");
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+    assert!(body_string(r).await.contains("no data for"));
+    drop(tx);
+    assert_eq!(staging_dirs(tmp.path()), 0);
+}
+
+#[tokio::test]
+async fn concurrent_uploads_are_limited() {
+    let tmp = tempfile::tempdir().unwrap();
+    let app = app(state_with(tmp.path(), |c| c.max_concurrent_uploads = 1));
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(1);
+    let slow = tokio::spawn({
+        let app = app.clone();
+        async move {
+            send(
+                &app,
+                put("slow.bin", "", b"").map_body(Body::from_stream(tokio_stream_from(rx))),
+            )
+            .await
+        }
+    });
+    tx.send(Ok("x".into())).await.unwrap();
+    // let the first upload take the only slot
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let r = send(&app, put("b.txt", "", b"y")).await;
+    assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+    drop(tx); // finish the first upload -> slot is free again
+    assert_eq!(slow.await.unwrap().status(), StatusCode::OK);
+    let r = send(&app, put("b.txt", "", b"y")).await;
+    assert_eq!(r.status(), StatusCode::OK);
+}
+
+/// mpsc receiver -> Stream (no tokio-stream dependency).
+fn tokio_stream_from<T: Send + 'static>(
+    rx: tokio::sync::mpsc::Receiver<T>,
+) -> impl futures_util::Stream<Item = T> + Send + 'static {
+    futures_util::stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|v| (v, rx)) })
+}
+
+trait MapBody {
+    fn map_body(self, body: Body) -> Request<Body>;
+}
+impl MapBody for Request<Body> {
+    fn map_body(self, body: Body) -> Request<Body> {
+        self.map(|_| body)
+    }
+}
+
+// ---------------------------------------------------- content isolation
+
+#[tokio::test]
+async fn shares_are_sandboxed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let st = state_with(tmp.path(), |_| {});
+    let mut stg = st.store.begin(100, 10).unwrap();
+    stg.put_bytes("page.html", b"<script>1</script>").unwrap();
+    let c = st.store.commit(stg, Duration::from_secs(60)).unwrap();
+    let app = app(st);
+    let file = send(&app, get(CONTENT, &format!("/s/{}/page.html", c.token))).await;
+    let csp = file.headers()[header::CONTENT_SECURITY_POLICY]
+        .to_str()
+        .unwrap();
+    assert!(csp.starts_with("sandbox ") && csp.contains("allow-scripts"));
+    assert!(!csp.contains("allow-same-origin"));
+    assert_eq!(file.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN], "*");
+    let list = send(&app, get(CONTENT, &format!("/s/{}/", c.token))).await;
+    assert!(list.headers().contains_key(header::CONTENT_SECURITY_POLICY));
+
+    // CONTENT_SANDBOX=false turns it off
+    let tmp = tempfile::tempdir().unwrap();
+    let st = state_with(tmp.path(), |c| c.content_sandbox = false);
+    let mut stg = st.store.begin(100, 10).unwrap();
+    stg.put_bytes("page.html", b"x").unwrap();
+    let c = st.store.commit(stg, Duration::from_secs(60)).unwrap();
+    let app = crate::app(st);
+    let r = send(&app, get(CONTENT, &format!("/s/{}/page.html", c.token))).await;
+    assert!(!r.headers().contains_key(header::CONTENT_SECURITY_POLICY));
+}
+
+#[tokio::test]
+async fn upload_page_keeps_token_per_tab_on_unsandboxed_single_host() {
+    let page = |tweak: fn(&mut Config)| async move {
+        let tmp = tempfile::tempdir().unwrap();
+        let st = state_with(tmp.path(), tweak);
+        body_string(send(&app(st), get(APP, "/")).await).await
+    };
+    assert!(page(|_| {}).await.contains("\"persistToken\":true"));
+    let single_unsandboxed = page(|c| {
+        c.content_url = c.public_url.clone();
+        c.content_host = c.public_host.clone();
+        c.content_sandbox = false;
+    })
+    .await;
+    assert!(single_unsandboxed.contains("\"persistToken\":false"));
 }

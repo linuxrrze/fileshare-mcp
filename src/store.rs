@@ -25,6 +25,8 @@ const TMP_PREFIX: &str = ".tmp-";
 /// Max length of one stored path (bytes) and of one path component.
 const MAX_PATH_LEN: usize = 1024;
 const MAX_COMPONENT_LEN: usize = 255;
+/// Max directory depth of one stored path (`a/b/c` = 3).
+const MAX_DEPTH: usize = 32;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FileEntry {
@@ -128,7 +130,7 @@ pub fn sanitize_path(p: &str) -> Option<String> {
             c => parts.push(c),
         }
     }
-    if parts.is_empty() {
+    if parts.is_empty() || parts.len() > MAX_DEPTH {
         return None;
     }
     Some(parts.join("/"))
@@ -157,6 +159,8 @@ pub struct Staging {
     files: BTreeMap<String, u64>,
     total: u64,
     max_total: u64,
+    /// Max number of files in the share (every upload path, incl. zips).
+    max_files: usize,
 }
 
 impl Staging {
@@ -170,7 +174,14 @@ impl Staging {
         self.files.keys()
     }
     /// Path inside the staging dir for `rel` (already sanitised); creates parents.
-    pub fn prepare(&mut self, rel: &str) -> io::Result<PathBuf> {
+    /// Fails once the share would hold more than `max_files` files.
+    pub fn prepare(&mut self, rel: &str) -> Result<PathBuf, UploadError> {
+        if !self.files.contains_key(rel) && self.files.len() >= self.max_files {
+            return Err(UploadError::Rejected(format!(
+                "too many files (limit {})",
+                self.max_files
+            )));
+        }
         let dest = self.dir.join("files").join(rel);
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent)?;
@@ -214,6 +225,17 @@ impl Staging {
         let zip_path = self.dir.join("files").join(rel);
         let zip_size = self.files.remove(rel).unwrap_or(0);
         self.total -= zip_size;
+
+        // ZipArchive::new parses the whole central directory into memory, so
+        // the entry cap has to hold *before* that: count the central-directory
+        // header signatures in the file (each parsed entry needs one; stray
+        // matches in compressed data only make this stricter).
+        let headers = count_central_headers(&zip_path, max_entries)?;
+        if headers > max_entries {
+            return Err(UploadError::Rejected(format!(
+                "{rel}: zip has more than {max_entries} entries"
+            )));
+        }
 
         let file = fs::File::open(&zip_path)?;
         let mut archive = zip::ZipArchive::new(io::BufReader::new(file))
@@ -289,6 +311,33 @@ impl Staging {
     }
 }
 
+/// Number of zip central-directory header signatures (`PK\x01\x02`) in the
+/// file, streaming with constant memory; stops counting past `stop_after`.
+fn count_central_headers(path: &std::path::Path, stop_after: usize) -> io::Result<usize> {
+    const SIG: &[u8; 4] = b"PK\x01\x02";
+    let finder = memchr::memmem::Finder::new(SIG);
+    let mut f = fs::File::open(path)?;
+    let mut buf = vec![0u8; 1 << 20];
+    let mut carry = 0usize; // bytes kept from the previous read (< SIG.len())
+    let mut count = 0usize;
+    loop {
+        let n = f.read(&mut buf[carry..])?;
+        if n == 0 {
+            return Ok(count);
+        }
+        let end = carry + n;
+        count += finder.find_iter(&buf[..end]).count();
+        if count > stop_after {
+            return Ok(count);
+        }
+        // Keep the last SIG.len()-1 bytes: a signature split across reads
+        // is found next time, a complete one is never counted twice.
+        let keep = end.min(SIG.len() - 1);
+        buf.copy_within(end - keep..end, 0);
+        carry = keep;
+    }
+}
+
 /// `Some("site")` if every path is `site/...`, else None.
 fn common_top_dir<'a>(mut names: impl Iterator<Item = &'a str>) -> Option<String> {
     let first = names.next()?;
@@ -320,7 +369,7 @@ impl Store {
         Ok(Self { root })
     }
 
-    pub fn begin(&self, max_total: u64) -> io::Result<Staging> {
+    pub fn begin(&self, max_total: u64, max_files: usize) -> io::Result<Staging> {
         let token = random_token();
         let dir = self.root.join(format!("{TMP_PREFIX}{token}"));
         fs::create_dir_all(dir.join("files"))?;
@@ -330,6 +379,7 @@ impl Store {
             files: BTreeMap::new(),
             total: 0,
             max_total,
+            max_files,
         })
     }
 
@@ -518,7 +568,7 @@ mod tests {
     fn commit_load_delete() {
         let tmp = tempfile::tempdir().unwrap();
         let store = Store::new(tmp.path()).unwrap();
-        let mut st = store.begin(1000).unwrap();
+        let mut st = store.begin(1000, 100).unwrap();
         st.put_bytes("a/b.txt", b"hello").unwrap();
         let c = store.commit(st, Duration::from_secs(60)).unwrap();
         let meta = store.load(&c.token).unwrap();
@@ -533,7 +583,7 @@ mod tests {
     fn quota_enforced() {
         let tmp = tempfile::tempdir().unwrap();
         let store = Store::new(tmp.path()).unwrap();
-        let mut st = store.begin(4).unwrap();
+        let mut st = store.begin(4, 100).unwrap();
         assert!(matches!(
             st.put_bytes("a", b"hello"),
             Err(UploadError::TooLarge)
@@ -544,7 +594,7 @@ mod tests {
     fn expired_share_hidden_and_swept() {
         let tmp = tempfile::tempdir().unwrap();
         let store = Store::new(tmp.path()).unwrap();
-        let mut st = store.begin(100).unwrap();
+        let mut st = store.begin(100, 100).unwrap();
         st.put_bytes("x", b"1").unwrap();
         let c = store.commit(st, Duration::from_secs(60)).unwrap();
         // backdate expiry
@@ -563,7 +613,7 @@ mod tests {
     fn zip_unpack_strips_top_dir() {
         let tmp = tempfile::tempdir().unwrap();
         let store = Store::new(tmp.path()).unwrap();
-        let mut st = store.begin(10_000).unwrap();
+        let mut st = store.begin(10_000, 100).unwrap();
         let z = make_zip(&[
             ("site/index.html", b"<img src=img/a.png>"),
             ("site/img/a.png", b"PNG"),
@@ -580,7 +630,7 @@ mod tests {
     fn zip_slip_rejected() {
         let tmp = tempfile::tempdir().unwrap();
         let store = Store::new(tmp.path()).unwrap();
-        let mut st = store.begin(10_000).unwrap();
+        let mut st = store.begin(10_000, 100).unwrap();
         let z = make_zip(&[("ok.txt", b"1"), ("../evil.txt", b"2")]);
         st.put_bytes("x.zip", &z).unwrap();
         assert!(matches!(
@@ -597,7 +647,7 @@ mod tests {
         // 1 MiB of zeros compresses to ~1 KiB, quota is 64 KiB
         let big = vec![0u8; 1 << 20];
         let z = make_zip(&[("zeros.bin", &big)]);
-        let mut st = store.begin(64 * 1024).unwrap();
+        let mut st = store.begin(64 * 1024, 100).unwrap();
         st.put_bytes("b.zip", &z).unwrap();
         assert!(matches!(
             st.unpack_zip("b.zip", 100),
@@ -605,11 +655,58 @@ mod tests {
         ));
 
         let z = make_zip(&[("a", b"1"), ("b", b"2"), ("c", b"3")]);
-        let mut st = store.begin(64 * 1024).unwrap();
+        let mut st = store.begin(64 * 1024, 100).unwrap();
         st.put_bytes("c.zip", &z).unwrap();
         assert!(matches!(
             st.unpack_zip("c.zip", 2),
             Err(UploadError::Rejected(_))
         ));
+    }
+
+    #[test]
+    fn central_headers_counted_across_reads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let entries: Vec<(String, Vec<u8>)> = (0..50)
+            .map(|i| (format!("f{i}"), vec![i as u8; 40_000]))
+            .collect();
+        let refs: Vec<(&str, &[u8])> = entries
+            .iter()
+            .map(|(n, d)| (n.as_str(), d.as_slice()))
+            .collect();
+        let p = tmp.path().join("z.zip");
+        fs::write(&p, make_zip(&refs)).unwrap();
+        assert_eq!(count_central_headers(&p, usize::MAX).unwrap(), 50);
+        assert!(count_central_headers(&p, 10).unwrap() > 10);
+        // a signature split across two reads is still found exactly once
+        let mut data = vec![b'x'; (1 << 20) - 2];
+        data.extend_from_slice(b"PK\x01\x02tail");
+        fs::write(&p, &data).unwrap();
+        assert_eq!(count_central_headers(&p, usize::MAX).unwrap(), 1);
+    }
+
+    #[test]
+    fn file_count_and_depth_limits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::new(tmp.path()).unwrap();
+        let mut st = store.begin(1000, 2).unwrap();
+        st.put_bytes("a", b"").unwrap();
+        st.put_bytes("b", b"").unwrap();
+        st.put_bytes("a", b"again").unwrap(); // replacing doesn't count
+        assert!(matches!(
+            st.put_bytes("c", b""),
+            Err(UploadError::Rejected(_))
+        ));
+
+        // extracted zip members count too
+        let z = make_zip(&[("x", b"1"), ("y", b"2"), ("z", b"3")]);
+        let mut st = store.begin(64 * 1024, 2).unwrap();
+        st.put_bytes("m.zip", &z).unwrap();
+        assert!(matches!(
+            st.unpack_zip("m.zip", 100),
+            Err(UploadError::Rejected(_))
+        ));
+
+        assert!(sanitize_path(&vec!["d"; 32].join("/")).is_some());
+        assert!(sanitize_path(&vec!["d"; 33].join("/")).is_none());
     }
 }

@@ -40,8 +40,22 @@ If both variables are set to the same URL, it runs in single-host mode and
 logs a warning at startup. That's fine on a LAN, but not for a public
 deployment.
 
-Pick a content domain that doesn't share cookies with anything else, i.e.
-not a subdomain of a domain whose apps set `Domain=` cookies.
+Every shared file is also sent with `Content-Security-Policy: sandbox …`
+(without `allow-same-origin`), so each page runs in its own opaque origin.
+Scripts still work, but a malicious share can't:
+
+- read another share's localStorage or IndexedDB
+- set cookies for sibling hosts
+- make requests that count as same-site to your other apps
+
+Pages that rely on localStorage or cookies break under the sandbox. Set
+`CONTENT_SANDBOX=false` only if you need them and trust the uploaders.
+Because of the sandbox, the shared files also carry
+`Access-Control-Allow-Origin: *`, so a page's own module scripts, `fetch()`es
+and fonts load. Anyone who can send those requests already has the URL.
+
+Ideally put `CONTENT_URL` on its own registrable domain, not a subdomain of
+your homelab domain. With the sandbox on this matters much less.
 
 ## Usage
 
@@ -80,7 +94,8 @@ curl -X DELETE -H "X-Delete-Token: <delete token>" https://share.example.de/api/
 
 - rejects `..` and absolute paths
 - skips symlinks
-- caps the entry count (`MAX_ZIP_ENTRIES`)
+- caps the entry count before the archive is parsed (at most 2 × `MAX_FILES`
+  central-directory entries, so directory entries fit too)
 - counts the *unpacked* size against `MAX_UPLOAD_SIZE`, so zip bombs stop at the limit
 
 Every shared file is sent with `X-Content-Type-Options: nosniff`,
@@ -116,6 +131,28 @@ Small text/HTML can also go through the `fileshare` MCP tools.
 If `UPLOAD_TOKEN` is set and `MCP_API_KEY` isn't, `create_share` refuses to
 work, so an open `/mcp` can't get around the protected upload API.
 
+### Limits against abuse
+
+Uploads are anonymous by default, so every upload path is bounded:
+
+- **Size:** file bytes count against `MAX_UPLOAD_SIZE` as they stream in,
+  with zips counted unpacked.
+- **Multipart:** text fields such as `expires` and `unpack`, and any unknown
+  fields, are capped at 1 KiB. One part's header block is capped at 16 KiB.
+  The number of parts is capped at `MAX_FILES` + 16.
+- **File count and depth:** a share can hold at most `MAX_FILES` files on any
+  upload path, and a path at most 32 directories deep.
+- **Stalled uploads:** an upload that sends nothing for `UPLOAD_IDLE_TIMEOUT`
+  is aborted and its staging directory removed.
+- **Concurrency:** at most `MAX_CONCURRENT_UPLOADS` uploads run at once. The
+  rest get `503` with `Retry-After`.
+
+There is **no global disk quota and no per-client rate limit**. A public,
+anonymous instance can be filled up with repeated uploads that last up to
+`MAX_EXPIRY`. For anything reachable from the internet, either set
+`UPLOAD_TOKEN`, or rate-limit `/api/upload` and `/mcp` at the proxy, and keep
+`/data` on a filesystem whose filling up doesn't hurt other services.
+
 ## Reverse proxy
 
 Route both hostnames to `fileshare:8080` (or `127.0.0.1:8080`). The proxy
@@ -138,10 +175,13 @@ All settings are environment variables; see `.env.sample`.
 | `PUBLIC_URL` / `CONTENT_URL` | `http://localhost:8080` / = `PUBLIC_URL` | See "Two hostnames". |
 | `DEFAULT_EXPIRY` / `MAX_EXPIRY` | `24h` / `30d` | Longer requested lifetimes are clamped to `MAX_EXPIRY`. |
 | `MAX_UPLOAD_SIZE` | `1G` | Per upload, after unpacking. |
-| `MAX_ZIP_ENTRIES` | `10000` | |
+| `MAX_FILES` | `10000` | Files per share, on every upload path. `MAX_ZIP_ENTRIES`, the 0.1.0 name, is still read. |
+| `UPLOAD_IDLE_TIMEOUT` | `60s` | Aborts an upload that sends no data for this long. |
+| `MAX_CONCURRENT_UPLOADS` | `16` | Further uploads get `503`. |
+| `CONTENT_SANDBOX` | `true` | Serves shares with a CSP sandbox (see "Two hostnames"). |
 | `SWEEP_INTERVAL` | `5m` | |
 | `UPLOAD_TOKEN` | empty (anonymous) | If set, uploads need `Authorization: Bearer …`. The web page then asks for it. |
-| `MCP_API_KEY` | empty (open) | If set, `/mcp` needs `Authorization: Bearer …` or `X-API-Key`. `.env.sample` ships the placeholder `CHANGE_ME`; fileshare refuses to start while any secret still contains it. |
+| `MCP_API_KEY` | empty (open) | If set, `/mcp` needs `Authorization: Bearer …` or `X-API-Key`. `.env.sample` ships the placeholder `CHANGE_ME`; fileshare refuses to start while any secret still contains it (in any letter case). |
 | `MCP_ALLOWED_HOSTS` | | Extra `Host` values accepted on `/mcp`. The `PUBLIC_URL` host and loopback are always allowed. |
 | `MCP_MAX_READ` / `MCP_MAX_BODY` | `5M` / `32M` | |
 | `BIND` / `DATA_DIR` | `0.0.0.0:8080` / `/data` | |
@@ -166,6 +206,9 @@ which drive the full router in-process:
 - MCP: 401 without the key; Bearer and `X-API-Key` accepted; foreign
   `Origin`/`Host` refused; a `create_share` → `read_file` → `delete_share`
   round trip
+- abuse limits: oversized text fields and part headers, file count on
+  every path, zip entry pre-count, stalled uploads, concurrent uploads
+- content sandbox headers
 
 The Docker build runs the same suite before compiling the release binary,
 so a failing test stops CI before anything is pushed.

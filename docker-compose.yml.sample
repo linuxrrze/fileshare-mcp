@@ -24,6 +24,16 @@ services:
     # `ports:` and put the proxy on a shared network instead).
     ports:
       - "127.0.0.1:8080:8080"
+    # Hardening: the binary only writes to /data and needs no privileges.
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    # Uploads stream to disk, so memory stays small; this caps the damage
+    # of anything unforeseen to this container instead of the host.
+    mem_limit: 512m
+    # Threads count as pids (tokio's blocking pool can grow to 512).
+    pids_limit: 1024
     # Uncomment to let containers on codingenv's network use
     # http://fileshare:8080/mcp (keep MCP_ALLOWED_HOSTS=fileshare in .env).
     # networks:

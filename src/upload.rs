@@ -1,17 +1,21 @@
 //! App-host endpoints: upload page, multipart/PUT upload, delete.
 
-use std::time::{Duration, UNIX_EPOCH};
+use std::{
+    io,
+    time::{Duration, UNIX_EPOCH},
+};
 
 use axum::{
     Json, Router,
-    body::Body,
-    extract::{DefaultBodyLimit, Multipart, Path, Query, State},
+    body::{Body, Bytes},
+    extract::{DefaultBodyLimit, Path, Query, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{Html, IntoResponse, Response},
     routing::{delete, get, post, put},
 };
+use futures_util::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
-use tokio::io::AsyncWriteExt;
+use tokio::{io::AsyncWriteExt, sync::OwnedSemaphorePermit};
 
 use crate::{
     Config, Shared,
@@ -26,7 +30,8 @@ pub fn routes(state: Shared) -> Router {
         .route("/api/upload", post(upload_multipart))
         .route("/api/upload/{*name}", put(upload_put))
         .route("/api/share/{token}", delete(delete_share))
-        // Size is enforced while streaming against MAX_UPLOAD_SIZE instead.
+        // Size is enforced while streaming (MAX_UPLOAD_SIZE for file data,
+        // multer limits for everything else) instead.
         .layer(DefaultBodyLimit::disable())
         .with_state(state)
 }
@@ -148,7 +153,9 @@ async fn finish(
         .collect();
     let unpack = unpack.unwrap_or(st.file_count() == 1 && zips.len() == 1);
     let store = state.store.clone();
-    let max_entries = state.cfg.max_zip_entries;
+    // Regular files are capped by max_files in Staging; allow as many
+    // directory entries on top.
+    let max_entries = state.cfg.max_files.saturating_mul(2);
     tokio::task::spawn_blocking(move || {
         if unpack {
             for z in &zips {
@@ -164,11 +171,148 @@ async fn finish(
     .map_err(|e| UploadError::Io(std::io::Error::other(e)))?
 }
 
-fn parse_bool(v: &str) -> Option<bool> {
+pub fn parse_bool(v: &str) -> Option<bool> {
     match v.trim().to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "on" => Some(true),
         "0" | "false" | "no" | "off" => Some(false),
         _ => None,
+    }
+}
+
+/// Max bytes of one multipart part's header block (Content-Disposition etc.).
+const MAX_PART_HEADER: u64 = 16 * 1024;
+/// Max bytes of a non-file multipart field (`expires`, `unpack`, unknown).
+const MAX_TEXT_FIELD: u64 = 1024;
+/// Non-file parts allowed besides the files.
+const EXTRA_PARTS: usize = 16;
+
+#[allow(clippy::result_large_err)] // only on the cold rejection path
+fn upload_slot(state: &Shared) -> Result<OwnedSemaphorePermit, Response> {
+    state.upload_slots.clone().try_acquire_owned().map_err(|_| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(header::RETRY_AFTER, "10")],
+            "too many uploads in progress, try again shortly\n",
+        )
+            .into_response()
+    })
+}
+
+/// The request body as a stream that fails when no data arrives for
+/// `idle` (slow-drip uploads would otherwise hold a task, a socket and a
+/// staging dir forever).
+fn idle_timeout(
+    body: Body,
+    idle: Duration,
+) -> impl Stream<Item = Result<Bytes, io::Error>> + Send + 'static {
+    futures_util::stream::unfold(Some(body.into_data_stream()), move |s| async move {
+        let mut s = s?;
+        match tokio::time::timeout(idle, s.next()).await {
+            Err(_) => Some((
+                Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("no data for {}", humantime::format_duration(idle)),
+                )),
+                None,
+            )),
+            Ok(None) => None,
+            Ok(Some(Ok(b))) => Some((Ok(b), Some(s))),
+            Ok(Some(Err(e))) => Some((Err(io::Error::other(e)), None)),
+        }
+    })
+}
+
+/// Watches a multipart stream and fails when one part's header block grows
+/// past `MAX_PART_HEADER`. multer buffers (and re-scans) a header block
+/// until its terminating blank line, with no size limit of its own.
+///
+/// Tracks only boundaries and blank lines: after each `\r\n--<boundary>`
+/// the header block runs to the next `\r\n\r\n`.
+struct HeaderGuard {
+    delim: memchr::memmem::Finder<'static>,
+    blank: memchr::memmem::Finder<'static>,
+    keep: usize,
+    in_headers: bool,
+    header_start: u64,
+    /// Stream offset of `tail[0]`.
+    offset: u64,
+    /// Unscanned end of the previous chunk (a match may straddle chunks).
+    tail: Vec<u8>,
+}
+
+impl HeaderGuard {
+    fn new(boundary: &str) -> Self {
+        let delim = format!("\r\n--{boundary}").into_bytes();
+        let keep = delim.len().max(4) - 1;
+        HeaderGuard {
+            delim: memchr::memmem::Finder::new(&delim).into_owned(),
+            blank: memchr::memmem::Finder::new(b"\r\n\r\n").into_owned(),
+            keep,
+            in_headers: false,
+            header_start: 0,
+            offset: 0,
+            // The body starts with `--<boundary>`: a virtual leading CRLF
+            // lets the first delimiter match like the others.
+            tail: b"\r\n".to_vec(),
+        }
+    }
+
+    fn feed(&mut self, chunk: &[u8]) -> Result<(), io::Error> {
+        let mut buf = std::mem::take(&mut self.tail);
+        buf.extend_from_slice(chunk);
+        let base = self.offset;
+        let too_big = || {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("multipart part headers exceed {MAX_PART_HEADER} bytes"),
+            )
+        };
+        let mut pos = 0;
+        loop {
+            if self.in_headers {
+                match self.blank.find(&buf[pos..]) {
+                    Some(i) => {
+                        pos += i + 4;
+                        if base + pos as u64 - self.header_start > MAX_PART_HEADER {
+                            return Err(too_big());
+                        }
+                        self.in_headers = false;
+                    }
+                    None => {
+                        if base + buf.len() as u64 - self.header_start > MAX_PART_HEADER {
+                            return Err(too_big());
+                        }
+                        break;
+                    }
+                }
+            } else {
+                match self.delim.find(&buf[pos..]) {
+                    Some(i) => {
+                        pos += i + self.delim.needle().len();
+                        self.in_headers = true;
+                        self.header_start = base + pos as u64;
+                    }
+                    None => break,
+                }
+            }
+        }
+        let from = pos.max(buf.len().saturating_sub(self.keep));
+        self.offset = base + from as u64;
+        self.tail = buf.split_off(from);
+        Ok(())
+    }
+}
+
+fn multipart_error(e: multer::Error) -> UploadError {
+    use multer::Error as E;
+    match e {
+        E::StreamSizeExceeded { .. } => UploadError::TooLarge,
+        E::FieldSizeExceeded { field_name, .. } => UploadError::Rejected(format!(
+            "multipart field {:?} too large",
+            field_name.unwrap_or_default()
+        )),
+        E::StreamReadFailed(e) => UploadError::Rejected(format!("upload interrupted: {e}")),
+        other => UploadError::Rejected(format!("bad multipart body: {other}")),
     }
 }
 
@@ -202,52 +346,97 @@ async fn upload_multipart(
     State(state): State<Shared>,
     Query(q): Query<UploadQuery>,
     headers: HeaderMap,
-    mut mp: Multipart,
+    body: Body,
 ) -> Response {
     if let Err(r) = check_upload_auth(&state.cfg, &headers) {
         return r;
     }
-    let mut st = match state.store.begin(state.cfg.max_upload) {
+    let boundary = match headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(multer::parse_boundary)
+    {
+        Some(Ok(b)) => b,
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "expected Content-Type: multipart/form-data with a boundary\n",
+            )
+                .into_response();
+        }
+    };
+    let _slot = match upload_slot(&state) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    let cfg = &state.cfg;
+    let max_parts = cfg.max_files.saturating_add(EXTRA_PARTS);
+    // File bytes are capped by the quota (charge); this bounds the rest:
+    // part headers and small fields, for at most `max_parts` parts.
+    let whole = cfg
+        .max_upload
+        .saturating_add(max_parts as u64 * (MAX_PART_HEADER + MAX_TEXT_FIELD + 64));
+    let limits = multer::SizeLimit::new()
+        .whole_stream(whole)
+        .per_field(MAX_TEXT_FIELD)
+        .for_field("file", cfg.max_upload)
+        .for_field("files", cfg.max_upload)
+        .for_field("file[]", cfg.max_upload);
+    let mut guard = HeaderGuard::new(&boundary);
+    let stream = idle_timeout(body, cfg.upload_idle_timeout).map(move |chunk| {
+        let chunk = chunk?;
+        guard.feed(&chunk)?;
+        Ok::<_, io::Error>(chunk)
+    });
+    let mut mp = multer::Multipart::with_constraints(
+        stream,
+        boundary,
+        multer::Constraints::new().size_limit(limits),
+    );
+
+    let mut st = match state.store.begin(cfg.max_upload, cfg.max_files) {
         Ok(s) => s,
         Err(e) => return upload_error(e.into()),
     };
     let mut expires = q.expires.clone();
     let mut unpack = q.unpack.as_deref().and_then(parse_bool);
 
-    let result: Result<(), UploadError> =
-        async {
-            while let Some(mut field) = mp
-                .next_field()
-                .await
-                .map_err(|e| UploadError::Rejected(format!("bad multipart body: {e}")))?
-            {
-                match field.name().unwrap_or("") {
-                    "expires" => expires = Some(field.text().await.unwrap_or_default()),
-                    "unpack" => unpack = parse_bool(&field.text().await.unwrap_or_default()),
-                    "file" | "files" | "file[]" => {
-                        let raw = field.file_name().unwrap_or("").to_string();
-                        let rel = sanitize_path(&raw).ok_or_else(|| {
-                            UploadError::Rejected(format!("invalid file name {raw:?}"))
-                        })?;
-                        let dest = st.prepare(&rel)?;
-                        let mut out = tokio::fs::File::create(&dest).await?;
-                        let mut size = 0u64;
-                        while let Some(chunk) = field.chunk().await.map_err(|e| {
-                            UploadError::Rejected(format!("upload interrupted: {e}"))
-                        })? {
-                            st.charge(chunk.len() as u64)?;
-                            out.write_all(&chunk).await?;
-                            size += chunk.len() as u64;
-                        }
-                        out.flush().await?;
-                        st.finish_file(&rel, size);
-                    }
-                    _ => {} // ignore unknown fields
-                }
+    let result: Result<(), UploadError> = async {
+        let mut parts = 0usize;
+        while let Some(mut field) = mp.next_field().await.map_err(multipart_error)? {
+            parts += 1;
+            if parts > max_parts {
+                return Err(UploadError::Rejected(format!(
+                    "too many multipart parts (limit {max_parts})"
+                )));
             }
-            Ok(())
+            match field.name().unwrap_or("") {
+                "expires" => expires = Some(field.text().await.map_err(multipart_error)?),
+                "unpack" => unpack = parse_bool(&field.text().await.map_err(multipart_error)?),
+                "file" | "files" | "file[]" => {
+                    let raw = field.file_name().unwrap_or("").to_string();
+                    let rel = sanitize_path(&raw).ok_or_else(|| {
+                        UploadError::Rejected(format!("invalid file name {raw:?}"))
+                    })?;
+                    let dest = st.prepare(&rel)?;
+                    let mut out = tokio::fs::File::create(&dest).await?;
+                    let mut size = 0u64;
+                    while let Some(chunk) = field.chunk().await.map_err(multipart_error)? {
+                        st.charge(chunk.len() as u64)?;
+                        out.write_all(&chunk).await?;
+                        size += chunk.len() as u64;
+                    }
+                    out.flush().await?;
+                    st.finish_file(&rel, size);
+                }
+                // Unknown fields are skipped (multer drains them, capped
+                // at MAX_TEXT_FIELD).
+                _ => {}
+            }
         }
-        .await;
+        Ok(())
+    }
+    .await;
     if let Err(e) = result {
         state.store.abort(st);
         return upload_error(e);
@@ -277,7 +466,6 @@ async fn upload_put(
     headers: HeaderMap,
     body: Body,
 ) -> Response {
-    use futures_util::StreamExt;
     if let Err(r) = check_upload_auth(&state.cfg, &headers) {
         return r;
     }
@@ -294,7 +482,11 @@ async fn upload_put(
         Ok(t) => t,
         Err(m) => return (StatusCode::BAD_REQUEST, format!("{m}\n")).into_response(),
     };
-    let mut st = match state.store.begin(state.cfg.max_upload) {
+    let _slot = match upload_slot(&state) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    let mut st = match state.store.begin(state.cfg.max_upload, state.cfg.max_files) {
         Ok(s) => s,
         Err(e) => return upload_error(e.into()),
     };
@@ -302,7 +494,7 @@ async fn upload_put(
         let dest = st.prepare(&rel)?;
         let mut out = tokio::fs::File::create(&dest).await?;
         let mut size = 0u64;
-        let mut stream = body.into_data_stream();
+        let mut stream = std::pin::pin!(idle_timeout(body, state.cfg.upload_idle_timeout));
         while let Some(chunk) = stream.next().await {
             let chunk =
                 chunk.map_err(|e| UploadError::Rejected(format!("upload interrupted: {e}")))?;
@@ -354,6 +546,8 @@ async fn index(State(state): State<Shared>) -> Html<String> {
         "defaultExpiry": cfg.default_expiry.as_secs(),
         "maxExpiry": cfg.max_expiry.as_secs(),
         "maxUpload": cfg.max_upload,
+        // Single host and no sandbox: shared pages could read a stored token.
+        "persistToken": cfg.split_hosts() || cfg.content_sandbox,
         "version": env!("CARGO_PKG_VERSION"),
     });
     Html(INDEX_HTML.replace("/*CONFIG*/{}", &conf.to_string()))
@@ -368,6 +562,30 @@ mod tests {
         assert!(ct_eq("abc", "abc"));
         assert!(!ct_eq("abc", "abd"));
         assert!(!ct_eq("abc", "abcd"));
+    }
+
+    fn guard_feed(chunks: &[&[u8]]) -> Result<(), io::Error> {
+        let mut g = HeaderGuard::new("B");
+        chunks.iter().try_for_each(|c| g.feed(c))
+    }
+
+    #[test]
+    fn header_guard() {
+        let ok = b"--B\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\nvalue\r\n--B--\r\n";
+        assert!(guard_feed(&[ok]).is_ok());
+        // byte-by-byte: matches straddling chunks are still found
+        let bytes: Vec<&[u8]> = ok.chunks(1).collect();
+        assert!(guard_feed(&bytes).is_ok());
+        // big part *data* is fine ...
+        let mut big = b"--B\r\nX: y\r\n\r\n".to_vec();
+        big.extend(std::iter::repeat_n(b'x', 100_000));
+        big.extend_from_slice(b"\r\n--B--\r\n");
+        assert!(guard_feed(&[&big]).is_ok());
+        // ... a header block that never ends is not, even in small chunks
+        let mut hdr = b"--B\r\nX: ".to_vec();
+        hdr.extend(std::iter::repeat_n(b'h', 20_000));
+        let small: Vec<&[u8]> = hdr.chunks(100).collect();
+        assert!(guard_feed(&small).is_err());
     }
 
     #[test]

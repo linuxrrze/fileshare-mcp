@@ -175,9 +175,9 @@ Content passes through your context: use the HTTP API (curl) for large files."
             decoded.push((rel, data));
         }
         let store = self.state.store.clone();
-        let max = cfg.max_upload;
+        let (max, max_files) = (cfg.max_upload, cfg.max_files);
         let created = tokio::task::spawn_blocking(move || {
-            let mut st = store.begin(max)?;
+            let mut st = store.begin(max, max_files)?;
             for (rel, data) in &decoded {
                 if let Err(e) = st.put_bytes(rel, data) {
                     store.abort(st);

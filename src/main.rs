@@ -38,7 +38,16 @@ pub struct Config {
     pub default_expiry: Duration,
     pub max_expiry: Duration,
     pub max_upload: u64,
-    pub max_zip_entries: usize,
+    /// Max files per share (all upload paths); a zip may additionally have
+    /// up to the same number of directory entries.
+    pub max_files: usize,
+    /// Abort an upload whose body sends no data for this long.
+    pub upload_idle_timeout: Duration,
+    /// Uploads processed at once; more get 503.
+    pub max_concurrent_uploads: usize,
+    /// Serve shares with `Content-Security-Policy: sandbox` (opaque origin
+    /// per page: no shared storage/cookies between shares or with siblings).
+    pub content_sandbox: bool,
     pub upload_token: Option<String>,
     pub mcp_api_key: Option<String>,
     pub mcp_allowed_hosts: Vec<String>,
@@ -102,7 +111,19 @@ impl Config {
             default_expiry: dur("DEFAULT_EXPIRY", "24h")?.min(max_expiry),
             max_expiry,
             max_upload: num("MAX_UPLOAD_SIZE", 1 << 30)?,
-            max_zip_entries: num("MAX_ZIP_ENTRIES", 10_000)? as usize,
+            // MAX_ZIP_ENTRIES: the 0.1.0 name of this setting.
+            max_files: match var("MAX_FILES") {
+                Some(_) => num("MAX_FILES", 10_000)?,
+                None => num("MAX_ZIP_ENTRIES", 10_000)?,
+            }
+            .max(1) as usize,
+            upload_idle_timeout: dur("UPLOAD_IDLE_TIMEOUT", "60s")?,
+            max_concurrent_uploads: num("MAX_CONCURRENT_UPLOADS", 16)?.max(1) as usize,
+            content_sandbox: match var("CONTENT_SANDBOX") {
+                None => true,
+                Some(v) => upload::parse_bool(&v)
+                    .ok_or_else(|| format!("CONTENT_SANDBOX={v}: expected true/false"))?,
+            },
             upload_token: secret(var("UPLOAD_TOKEN"), "UPLOAD_TOKEN")?,
             mcp_api_key: secret(var("MCP_API_KEY"), "MCP_API_KEY")?,
             mcp_allowed_hosts: var("MCP_ALLOWED_HOSTS")
@@ -126,7 +147,7 @@ pub const PLACEHOLDER: &str = "CHANGE_ME";
 
 fn secret(v: Option<String>, name: &str) -> Result<Option<String>, String> {
     match v {
-        Some(v) if v.contains(PLACEHOLDER) => Err(format!(
+        Some(v) if v.to_ascii_uppercase().contains(PLACEHOLDER) => Err(format!(
             "{name} is still the .env.sample placeholder -- set a real value \
              (e.g. `openssl rand -hex 32`) or leave it empty to disable"
         )),
@@ -171,6 +192,18 @@ pub fn parse_size(s: &str) -> Option<u64> {
 pub struct AppState {
     pub cfg: Config,
     pub store: Store,
+    /// One permit per upload being received/processed.
+    pub upload_slots: Arc<tokio::sync::Semaphore>,
+}
+
+impl AppState {
+    pub fn new(cfg: Config, store: Store) -> Shared {
+        Arc::new(AppState {
+            upload_slots: Arc::new(tokio::sync::Semaphore::new(cfg.max_concurrent_uploads)),
+            cfg,
+            store,
+        })
+    }
 }
 
 pub type Shared = Arc<AppState>;
@@ -273,7 +306,12 @@ async fn main() {
     if !cfg.split_hosts() {
         tracing::warn!(
             "PUBLIC_URL and CONTENT_URL share one host: uploaded HTML runs on the same origin as the \
-             upload page and /mcp. Set CONTENT_URL to a separate hostname for public deployments."
+             upload page and /mcp{}. Set CONTENT_URL to a separate hostname for public deployments.",
+            if cfg.content_sandbox {
+                ""
+            } else {
+                " and, with CONTENT_SANDBOX off, can read the upload token the page keeps in the browser"
+            }
         );
     }
     if cfg.upload_token.is_none() {
@@ -290,7 +328,7 @@ async fn main() {
         cfg.content_url
     );
 
-    let state = Arc::new(AppState { cfg, store });
+    let state = AppState::new(cfg, store);
 
     // expiry sweeper
     {
@@ -357,6 +395,7 @@ mod tests {
     fn placeholder_secret_rejected() {
         assert!(secret(Some("CHANGE_ME".into()), "MCP_API_KEY").is_err());
         assert!(secret(Some("CHANGE_ME-to-a-random-key".into()), "MCP_API_KEY").is_err());
+        assert!(secret(Some("change_me".into()), "MCP_API_KEY").is_err());
         assert_eq!(
             secret(Some("s3cret".into()), "X").unwrap().as_deref(),
             Some("s3cret")

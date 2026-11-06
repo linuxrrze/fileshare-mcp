@@ -123,6 +123,16 @@ async fn serve(st: &Shared, token: &str, path: &str, req: Request) -> Response {
         header::CACHE_CONTROL,
         HeaderValue::from_static("private, max-age=60"),
     );
+    if st.cfg.content_sandbox {
+        sandbox(h);
+        // A sandboxed page has an opaque origin, so its own module scripts,
+        // fetch()es and web fonts are cross-origin requests. Anyone who can
+        // send them already holds the URL (= the secret); no credentials.
+        h.insert(
+            header::ACCESS_CONTROL_ALLOW_ORIGIN,
+            HeaderValue::from_static("*"),
+        );
+    }
     if download {
         let name = rel.rsplit('/').next().unwrap_or(&rel);
         let v = format!(
@@ -134,6 +144,19 @@ async fn serve(st: &Shared, token: &str, path: &str, req: Request) -> Response {
         }
     }
     resp
+}
+
+/// Every shared page runs in its own opaque origin: scripts work, but it
+/// can't read other shares' storage or set cookies for sibling hosts, and
+/// its requests aren't same-site to them.
+const SANDBOX_CSP: &str = "sandbox allow-scripts allow-forms allow-popups \
+allow-popups-to-escape-sandbox allow-modals allow-downloads";
+
+fn sandbox(h: &mut axum::http::HeaderMap) {
+    h.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(SANDBOX_CSP),
+    );
 }
 
 fn esc(s: &str) -> String {
@@ -160,7 +183,7 @@ fn human(n: u64) -> String {
 
 /// Listing of a share without index.html. The token is the secret, so
 /// listing a share's own files to whoever holds it is fine.
-fn listing(_st: &Shared, _token: &str, meta: &Meta) -> Response {
+fn listing(st: &Shared, _token: &str, meta: &Meta) -> Response {
     let expires =
         humantime::format_rfc3339_seconds(UNIX_EPOCH + Duration::from_secs(meta.expires_at));
     let mut rows = String::new();
@@ -200,6 +223,9 @@ td.n{{white-space:nowrap;color:var(--muted);text-align:right}}a{{color:var(--lin
         header::CACHE_CONTROL,
         HeaderValue::from_static("private, no-cache"),
     );
+    if st.cfg.content_sandbox {
+        sandbox(h);
+    }
     r
 }
 
