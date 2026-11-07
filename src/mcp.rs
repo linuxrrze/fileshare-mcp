@@ -35,7 +35,8 @@ use crate::{
 };
 
 const INSTRUCTIONS: &str = "Temporary file sharing. create_share uploads one or more files (text or \
-base64) and returns an unguessable URL that expires; HTML shares render in the browser and relative \
+base64) and returns an unguessable URL that expires: links are temporary, never permanent download links, \
+so tell the user when they stop working (expires_at). HTML shares render in the browser and relative \
 links between files of one share work (e.g. index.html + img/logo.png). Every byte passed through \
 these tools goes through your context window: for large or binary files on disk prefer the HTTP API \
 (`curl -T <file> <PUBLIC_URL>/api/upload/<name>` prints the URL).";
@@ -59,7 +60,7 @@ pub struct CreateShareArgs {
     )]
     pub files: Vec<McpFile>,
     #[schemars(
-        description = "Lifetime like `30m`, `24h`, `7d` (default: server default, capped at server maximum)"
+        description = "Lifetime like `30m`, `24h`, `7d` (default: server default, capped at server maximum); the share and its URL are gone afterwards"
     )]
     pub expires: Option<String>,
 }
@@ -146,7 +147,8 @@ impl FileShareMcp {
 
     #[tool(
         description = "Create a new share from one or more files and return its URL, \
-expiry and delete_token. HTML renders inline; relative links between files of the share work. \
+expiry and delete_token. The link is temporary: it stops working at expires_at, so tell the \
+user when it expires. HTML renders inline; relative links between files of the share work. \
 Content passes through your context: use the HTTP API (curl) for large files."
     )]
     async fn create_share(
