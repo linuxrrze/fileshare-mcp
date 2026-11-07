@@ -263,6 +263,20 @@ pub fn app(state: Shared) -> Router {
         .layer(tower_http::trace::TraceLayer::new_for_http())
 }
 
+/// Startup banner (image name + version), rendered by CI and added to the
+/// image by .gitea/scripts/add-banner.sh. The image is FROM scratch, so there
+/// is no shell for the usual wrapper: the Dockerfile opts into the built-in
+/// mode (`LABEL de.linux-ng.image-banner=builtin`) and the binary prints the
+/// file itself. Absent outside the CI-built image (cargo run, tests).
+const BANNER_FILE: &str = "/usr/local/share/image-banner.txt";
+
+fn print_banner() {
+    if let Ok(text) = std::fs::read(BANNER_FILE) {
+        let mut out = std::io::stdout().lock();
+        let _ = out.write_all(&text).and_then(|()| out.flush());
+    }
+}
+
 /// `fileshare healthcheck`: GET /healthz on the local port (for Docker's
 /// HEALTHCHECK -- the image has no curl/wget we want to rely on).
 fn healthcheck() -> ! {
@@ -299,6 +313,7 @@ async fn main() {
         None => {}
     }
 
+    print_banner();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_env("LOG_LEVEL")

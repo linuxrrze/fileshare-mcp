@@ -226,8 +226,8 @@ PUBLIC_URL=http://app.localhost:8080 CONTENT_URL=http://content.localhost:8080 \
 | --- | --- | --- |
 | `Cargo.toml` / `Cargo.lock` | yes | Crate and pinned dependencies. `version` is the image tag. Run `cargo update` to pick up crate fixes, then commit the lock file. |
 | `src/` | yes | `main.rs` (config, Host routing, sweeper, `healthcheck` subcommand), `http_tests.rs` (HTTP-level tests), `store.rs` (tokens, staging, zip, expiry), `upload.rs` (app-host API and page), `serve.rs` (content host), `mcp.rs` (MCP tools), `assets/index.html`. |
-| `Dockerfile` | yes | `rust:alpine` runs `cargo test`, then `cargo auditable` builds a static musl binary, which goes onto `busybox:musl`. busybox rather than scratch because the startup banner needs `/bin/sh`. |
-| `.fileshare-base-digest` | yes | Registry digest of the busybox base the last build used. Updated automatically by CI. |
+| `Dockerfile` | yes | `rust:alpine` runs `cargo test`, then `cargo auditable` builds a static musl binary, which goes onto `scratch`. The image holds only the binary, `/data` and the banner text (about 5 MB, 2 files). The binary prints the startup banner itself (`LABEL de.linux-ng.image-banner=builtin`) and is its own healthcheck client. |
+| `.fileshare-base-digest` | yes | Registry digest of the `rust:alpine` build image the last build used. With a scratch final stage, that's the only base. A new digest means a new toolchain and musl, which are linked into the binary. Updated automatically by CI. |
 | `.env.sample` | no | Runtime settings template. Real tokens go only in the local, gitignored `.env`. |
 | `docker-compose.yml.sample` | no | Template for the gitignored `docker-compose.yml`. |
 
@@ -237,7 +237,7 @@ PUBLIC_URL=http://app.localhost:8080 CONTENT_URL=http://content.localhost:8080 \
 builds source living in this repo (Flavor 2 plus the base-digest check).
 
 - **Triggers:** a push touching `src/`, `Cargo.*`, `Dockerfile` or the
-  workflow rebuilds. A daily check rebuilds only when the busybox base is
+  workflow rebuilds. A daily check rebuilds only when the `rust:alpine` build image is
   re-published.
 - **Tags:** `:<Cargo version>`, `:<version>-<YYYYMMDD>` (for rollback) and
   `:latest`.

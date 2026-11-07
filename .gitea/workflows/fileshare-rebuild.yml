@@ -5,7 +5,9 @@ run-name: ${{ github.event_name == 'schedule' && 'Scheduled check' || github.eve
 
 # Flavor 2 (the source lives in this repo, fileshare/ is a standalone Rust
 # project) plus the base-digest check: push rebuilds on source changes, the
-# daily schedule only when busybox (the final stage) is re-published.
+# daily schedule only when the rust:alpine build image is re-published (the
+# final stage is scratch; base-digest.sh then tracks the build stage, whose
+# toolchain + musl end up in the static binary).
 on:
   schedule:
     - cron: '17 4 * * *'
@@ -26,7 +28,8 @@ on:
 env:
   REGISTRY: git.linux-ng.de
   IMAGE: git.linux-ng.de/marcel/fileshare
-  # Digest of the Dockerfile's final base image (busybox) the last build used.
+  # Digest of the Dockerfile's base image (rust:alpine build stage; the final
+  # stage is scratch) the last build used.
   BASE_DIGEST_FILE: fileshare/.fileshare-base-digest
 
 jobs:
@@ -74,7 +77,9 @@ jobs:
 
       # Startup banner (image name + version, figlet style) as a thin layer
       # on top of the built image, same tags -- see .gitea/scripts/add-banner.sh.
-      # Needs /bin/sh + cat: that's why the final stage is busybox, not scratch.
+      # The image is FROM scratch (no shell): its Dockerfile sets
+      # LABEL de.linux-ng.image-banner=builtin, so the script only adds the
+      # banner text and the binary prints it on start.
       - name: Add startup banner
         if: github.event_name != 'schedule' || steps.base.outputs.changed == 'true'
         run: |
