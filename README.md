@@ -86,7 +86,7 @@ curl -X DELETE -H "X-Delete-Token: <delete token>" https://share.example.de/api/
 | `POST /api/upload` | multipart. `file` (repeatable; the filename may contain `dir/x.png`), `expires`, `unpack`. Replies with JSON (`url`, `share_url`, `token`, `expires_at`, `delete_url`, `delete_token`, `files`); `?format=text` gives just the URL. |
 | `PUT /api/upload/<name>` | Raw body. `?expires=` or `X-Expires:` header. Replies with the URL; `?format=json` gives the JSON. |
 | `DELETE /api/share/<token>` | Header `X-Delete-Token`. |
-| `GET /s/<token>/[path]` | Served inline, with the content type from the extension. `index.html` is served for directory URLs; a share without one shows a file list. `?download=1` forces a download. |
+| `GET /s/<token>/[path]` | Served inline, with the content type from the extension. `index.html` is served for directory URLs. Only the share root lists its files when it has no `index.html`; a subdirectory without one returns 404 ("not found (or expired)", the same answer as for an unknown or expired share). `?download=1` forces a download. |
 | `GET /healthz` | Liveness. |
 
 `unpack` defaults to true when the upload is exactly one `.zip`. Pass
@@ -112,10 +112,16 @@ claude mcp add --transport http fileshare http://fileshare:8080/mcp
 ```
 | Tool | Does |
 | --- | --- |
-| `create_share {files:[{path, text \| base64}], expires?}` | Creates a share and returns `url`, `share_url`, `delete_token` and `expires_at`. |
+| `create_share {files:[{path, text \| base64}], expires?}` | Creates a share and returns `url`, `share_url`, `delete_token` and `expires_at`. The link is temporary: it stops working at `expires_at` (default `DEFAULT_EXPIRY`, at most `MAX_EXPIRY`). |
 | `list_share {share}` | Lists the files (path, size, mime, URL) and the expiry. |
 | `read_file {url, path?}` | Returns text as text, images as image content, and anything else as a base64 resource. Capped by `MCP_MAX_READ`. |
 | `delete_share {share, delete_token}` | Deletes the share immediately. |
+
+MCP shares are temporary like every other share, never permanent download
+links: after `expires_at` the URL returns 404 and the files are deleted. The
+server's MCP instructions say so ("Temporary file sharing … returns an
+unguessable URL that expires"). When an agent hands a link on, it should
+mention the expiry.
 
 Everything sent through MCP passes through the model's context. For big or
 binary files, have the agent use curl instead. A snippet for
