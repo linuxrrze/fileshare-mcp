@@ -166,6 +166,27 @@ must:
   uploads stream instead of being spooled to the proxy's disk.
 - **Leave `/mcp` unbuffered** (`proxy_buffering off;`). It uses SSE.
 
+### Traefik
+
+`docker-compose.yml.sample` has the labels: one router per hostname
+(`fileshare` and `fileshare-content`), both pointing at one service on port
+8080. The defaults already meet the list above: Traefik passes `Host`, and it
+streams request bodies and SSE without buffering or a size limit, as long as
+no `buffering` middleware is attached.
+
+The exception is the entrypoint's `readTimeout`. Since Traefik v2.11/v3 it
+defaults to 60s, and it covers the whole request body, so an upload that
+takes longer than that is cut off. It's static configuration and can't be set
+by a label. Raise it on the entrypoint the routers use, e.g. in `traefik.yml`:
+
+```yaml
+entryPoints:
+  https:
+    transport:
+      respondingTimeouts:
+        readTimeout: 0   # no limit; fileshare's UPLOAD_IDLE_TIMEOUT catches stalled uploads
+```
+
 ## Configuration
 
 All settings are environment variables; see `.env.sample`.

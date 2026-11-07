@@ -24,6 +24,34 @@ services:
     # `ports:` and put the proxy on a shared network instead).
     ports:
       - "127.0.0.1:8080:8080"
+    # Traefik: one router per hostname, both to the same service. The Host()
+    # rules must match PUBLIC_URL and CONTENT_URL in .env. Traefik already
+    # passes the Host header, streams request bodies (no buffering, no size
+    # limit) and flushes SSE on /mcp -- but its entrypoint readTimeout
+    # (default 60s) also cuts off slow uploads; see README "Reverse proxy".
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.fileshare.rule=Host(`share.example.de`)"
+      - "traefik.http.routers.fileshare.entrypoints=https"
+      - "traefik.http.routers.fileshare.tls=true"
+      - "traefik.http.routers.fileshare.tls.certresolver=letsEncrypt"
+      - "traefik.http.routers.fileshare.service=fileshare"
+      - "traefik.http.routers.fileshare-content.rule=Host(`share-content.example.de`)"
+      - "traefik.http.routers.fileshare-content.entrypoints=https"
+      - "traefik.http.routers.fileshare-content.tls=true"
+      - "traefik.http.routers.fileshare-content.tls.certresolver=letsEncrypt"
+      - "traefik.http.routers.fileshare-content.service=fileshare"
+      - "traefik.http.services.fileshare.loadbalancer.server.port=8080"
+      ## Optional, for an internet-facing instance without UPLOAD_TOKEN: rate
+      ## limit the app host (upload page, /api, /mcp) per client IP.
+      # - "traefik.http.middlewares.fileshare-ratelimit.ratelimit.average=10"
+      # - "traefik.http.middlewares.fileshare-ratelimit.ratelimit.burst=20"
+      # - "traefik.http.routers.fileshare.middlewares=fileshare-ratelimit"
+      ## Only if the container is on more than one network: tell Traefik
+      ## which one it shares with the container.
+      # - "traefik.docker.network=traefik"
+    # A real deployment needs a network shared with Traefik -- add it here
+    # per deployment (left out of the sample, as in the other images).
     # Hardening: the binary only writes to /data and needs no privileges.
     read_only: true
     cap_drop: [ALL]
