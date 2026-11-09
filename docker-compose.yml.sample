@@ -9,7 +9,8 @@
 # CONTENT_URL), forwarding the original Host header, with no body size limit
 # and request buffering off -- see README "Reverse proxy".
 # Internal read/write, external read-only: WRITE_ALLOWED_NETS + TRUSTED_PROXIES
-# in .env (README "Internal read/write, external read-only").
+# in .env. Traefik needs a fixed address for that (README "Traefik: client
+# addresses"); never list Traefik's network in WRITE_ALLOWED_NETS.
 
 services:
   fileshare:

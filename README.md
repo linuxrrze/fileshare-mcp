@@ -169,13 +169,18 @@ network, or the bridge gateway (e.g. `172.17.0.1`) when the proxy reaches a
 published port. Traefik and nginx (`proxy_set_header X-Forwarded-For
 $proxy_add_x_forwarded_for;`) both send the header.
 
-Example: LAN and VPN may write, the proxy is Traefik on `proxy`
-(172.20.0.0/16), and agent containers on that network may write too:
+Example: LAN and VPN may write, Traefik has the fixed address 172.30.0.2,
+and agent containers on codingenv's network (172.31.0.0/24) may write too:
 
 ```sh
-WRITE_ALLOWED_NETS=192.168.10.0/24,10.8.0.0/24,172.20.0.0/16
-TRUSTED_PROXIES=172.20.0.2
+WRITE_ALLOWED_NETS=192.168.10.0/24,10.8.0.0/24,172.31.0.0/24
+TRUSTED_PROXIES=172.30.0.2
 ```
+
+**Never put the proxy's own network, or its gateway, into
+`WRITE_ALLOWED_NETS`.** If the proxy's address changes, or Docker relays
+clients through the gateway, fileshare sees every visitor as coming from
+that network and lets them write. See "Traefik: client addresses" below.
 
 Both lists take IPv4 and IPv6. IPv4 clients on a dual-stack socket
 (`::ffff:a.b.c.d`) match plain IPv4 networks. On a dual-stack LAN, internal
@@ -249,6 +254,71 @@ entryPoints:
       respondingTimeouts:
         readTimeout: 0   # no limit; fileshare's UPLOAD_IDLE_TIMEOUT catches stalled uploads
 ```
+
+### Traefik: client addresses
+
+For `WRITE_ALLOWED_NETS` to see real clients, the setup needs three things.
+Traefik itself needs no extra configuration: it drops `X-Forwarded-For`
+from clients it doesn't trust and sends the address the connection came
+from.
+
+**1. A fixed address for Traefik.** Docker assigns container addresses at
+start, so Traefik can come back with a different one after a recreate.
+fileshare would then treat Traefik as the client. If `TRUSTED_PROXIES` is
+wrong, everyone is read-only (safe). It is only dangerous if that address
+lies inside `WRITE_ALLOWED_NETS`: then everyone can write. Pin it in
+Traefik's compose file:
+
+```yaml
+services:
+  traefik:
+    networks:
+      traefik:
+        ipv4_address: 172.30.0.2
+        ipv6_address: fd00:30::2     # with IPv6, see 2.
+networks:
+  traefik:
+    name: traefik
+    enable_ipv6: true
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+        - subnet: fd00:30::/64
+```
+
+fileshare joins that network (`external: true`, and
+`traefik.docker.network=traefik` if it has several) with
+`TRUSTED_PROXIES=172.30.0.2,fd00:30::2`. Keep `172.30.0.0/24` out of
+`WRITE_ALLOWED_NETS`. Give containers that should write over the network
+(agents using `/mcp`) a network of their own and list that.
+
+**2. Published ports and IPv6.** When Docker publishes Traefik's ports
+(`443:443`), IPv4 clients keep their address. On a network without IPv6,
+though, docker-proxy relays IPv6 clients, and Traefik sees the network's
+gateway (e.g. `172.30.0.1`) for all of them. Either enable IPv6 on the
+Traefik network as above (with Docker's default `ip6tables`, IPv6 clients
+then keep their address too), or run Traefik with `network_mode: host`. In
+host mode Traefik reaches fileshare through the published
+`127.0.0.1:8080`, and fileshare sees the gateway of its own network; that
+gateway is then the address for `TRUSTED_PROXIES`.
+
+**3. Anything in front of Traefik.** A router forwarding ports (NAT) needs
+nothing. If another proxy, load balancer or CDN sits in front, Traefik
+replaces that hop's `X-Forwarded-For` unless the entrypoint trusts it, and
+fileshare sees that hop as the client:
+
+```yaml
+entryPoints:
+  https:
+    forwardedHeaders:
+      trustedIPs: ["192.0.2.10"]   # the upstream proxy
+```
+
+**Check it**: upload once from inside and once from outside, over both
+IPv4 and IPv6, with `LOG_LEVEL=info,fileshare=debug`. Successful uploads log
+`share created ... client=<ip>`, and refused ones log `write refused:
+read-only client` with the address. Every address shown should be the real
+client, never Traefik or a Docker gateway.
 
 ## Configuration
 
