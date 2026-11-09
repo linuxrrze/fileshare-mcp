@@ -137,6 +137,59 @@ Small text/HTML can also go through the `fileshare` MCP tools.
 If `UPLOAD_TOKEN` is set and `MCP_API_KEY` isn't, `create_share` refuses to
 work, so an open `/mcp` can't get around the protected upload API.
 
+### Internal read/write, external read-only
+
+Set `WRITE_ALLOWED_NETS` (comma-separated CIDRs or addresses) to allow
+uploads and deletes only from those networks. Everyone else gets read-only
+access:
+
+- `POST`/`PUT`/`DELETE` on `/api/*` get `403`.
+- The upload page shows a notice in place of the form.
+- On `/mcp`, `create_share` and `delete_share` are refused, while
+  `list_share` and `read_file` keep working.
+- Share links (`/s/...`) work for everyone.
+
+If `WRITE_ALLOWED_NETS` is empty (the default), everyone may write.
+
+**Behind a reverse proxy**, fileshare only sees the proxy's address. Set
+`TRUSTED_PROXIES` to the address(es) the proxy connects *from*. fileshare
+then reads `X-Forwarded-For` from those peers only (from any other peer the
+header is ignored, because a client could forge it). It reads the header
+right to left and takes the first entry that is not itself a trusted proxy,
+so entries a client forged further left don't count. If an entry can't be
+parsed where the client should be, the client counts as unknown and is
+read-only. A trusted peer that sends no `X-Forwarded-For` is treated as the
+client itself, e.g. an agent container calling `http://fileshare:8080/mcp`
+on the proxy's network.
+
+To find the proxy address, upload once with `TRUSTED_PROXIES` unset: the
+`share created` log line has a `client=` field, and behind a proxy that is
+the proxy. Typical values are Traefik's container IP on the shared Docker
+network, or the bridge gateway (e.g. `172.17.0.1`) when the proxy reaches a
+published port. Traefik and nginx (`proxy_set_header X-Forwarded-For
+$proxy_add_x_forwarded_for;`) both send the header.
+
+Example: LAN and VPN may write, the proxy is Traefik on `proxy`
+(172.20.0.0/16), and agent containers on that network may write too:
+
+```sh
+WRITE_ALLOWED_NETS=192.168.10.0/24,10.8.0.0/24,172.20.0.0/16
+TRUSTED_PROXIES=172.20.0.2
+```
+
+Both lists take IPv4 and IPv6. IPv4 clients on a dual-stack socket
+(`::ffff:a.b.c.d`) match plain IPv4 networks. On a dual-stack LAN, internal
+clients often reach the public hostname over IPv6 from their global
+address, so list the LAN's IPv6 prefix too. If the ISP changes that prefix,
+use split DNS instead: internally, answer with only the internal IPv4
+address, or with a ULA (`fd…`) address, and list that.
+
+Avoid listing a whole network in `TRUSTED_PROXIES` when other containers on
+it can reach fileshare directly: any of them could then claim to be an
+internal client in `X-Forwarded-For`.
+
+`UPLOAD_TOKEN` and `MCP_API_KEY` still apply on top of the network check.
+
 ### Limits against abuse
 
 Uploads are anonymous by default, so every upload path is bounded:
@@ -156,7 +209,7 @@ Uploads are anonymous by default, so every upload path is bounded:
 There is **no global disk quota and no per-client rate limit**. A public,
 anonymous instance can be filled up with repeated uploads that last up to
 `MAX_EXPIRY`. For anything reachable from the internet, either set
-`UPLOAD_TOKEN`, or rate-limit `/api/upload` and `/mcp` at the proxy, and keep
+`UPLOAD_TOKEN` or `WRITE_ALLOWED_NETS`, or rate-limit `/api/upload` and `/mcp` at the proxy, and keep
 `/data` on a filesystem whose filling up doesn't hurt other services.
 
 ## Reverse proxy
@@ -171,6 +224,10 @@ must:
 - **Turn request buffering off** (`proxy_request_buffering off;`), so large
   uploads stream instead of being spooled to the proxy's disk.
 - **Leave `/mcp` unbuffered** (`proxy_buffering off;`). It uses SSE.
+- **Append the client address to `X-Forwarded-For`**, if you use
+  `WRITE_ALLOWED_NETS` (Traefik does this by default; nginx:
+  `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;`), and set
+  `TRUSTED_PROXIES` (see "Internal read/write, external read-only").
 
 ### Traefik
 
@@ -209,6 +266,8 @@ All settings are environment variables; see `.env.sample`.
 | `SWEEP_INTERVAL` | `5m` | |
 | `UPLOAD_TOKEN` | empty (anonymous) | If set, uploads need `Authorization: Bearer …`. The web page then asks for it. |
 | `MCP_API_KEY` | empty (open) | If set, `/mcp` needs `Authorization: Bearer …` or `X-API-Key`. `.env.sample` ships the placeholder `CHANGE_ME`; fileshare refuses to start while any secret still contains it (in any letter case). |
+| `WRITE_ALLOWED_NETS` | empty (everyone) | CIDRs/addresses that may upload and delete; others are read-only. |
+| `TRUSTED_PROXIES` | empty | Peers whose `X-Forwarded-For` is believed (the reverse proxy). |
 | `MCP_ALLOWED_HOSTS` | | Extra `Host` values accepted on `/mcp`. The `PUBLIC_URL` host and loopback are always allowed. |
 | `MCP_MAX_READ` / `MCP_MAX_BODY` | `5M` / `32M` | |
 | `BIND` / `DATA_DIR` | `0.0.0.0:8080` / `/data` | |

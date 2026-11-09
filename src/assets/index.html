@@ -77,6 +77,15 @@ let last = null;
 
 const human = n => { const u=['B','KiB','MiB','GiB','TiB']; let i=0; while(n>=1024&&i<u.length-1){n/=1024;i++} return (i?n.toFixed(1):n)+' '+u[i]; };
 $('foot').textContent = `fileshare ${CONF.version || ''} · max ${human(CONF.maxUpload||0)} per upload`;
+if (CONF.uploadAllowed === false) {
+  // Read-only client (outside WRITE_ALLOWED_NETS): the API would refuse anyway.
+  $('foot').textContent = `fileshare ${CONF.version || ''}`;
+  const card = document.querySelector('.card');
+  for (const el of card.children) el.classList.add('hidden');
+  card.append(Object.assign(document.createElement('p'), {
+    className: 'small', style: 'margin:0',
+    textContent: 'Uploads are only possible from the internal network. Share links work from anywhere.'}));
+}
 
 const choices = [['1h',3600],['24h',86400],['7d',604800],['30d',2592000],['90d',7776000]];
 for (const [label, secs] of choices) {

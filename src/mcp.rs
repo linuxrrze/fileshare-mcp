@@ -9,14 +9,14 @@ use std::sync::Arc;
 use axum::{
     Router,
     extract::{Request, State},
-    http::{StatusCode, header},
+    http::{StatusCode, header, request::Parts},
     middleware::{self, Next},
     response::{IntoResponse, Response},
 };
 use base64::Engine;
 use rmcp::{
     ErrorData, ServerHandler,
-    handler::server::{router::tool::ToolRouter, wrapper::Parameters},
+    handler::server::{router::tool::ToolRouter, tool::Extension, wrapper::Parameters},
     model::{
         CallToolResult, ContentBlock, Implementation, ResourceContents, ServerCapabilities,
         ServerConfig,
@@ -30,6 +30,7 @@ use serde::Deserialize;
 
 use crate::{
     Shared,
+    access::{Access, READ_ONLY_MSG},
     store::{UploadError, sanitize_path, valid_token},
     upload::{bearer, build_response, ct_eq, ttl},
 };
@@ -124,6 +125,25 @@ fn internal(what: &str, e: impl std::fmt::Display) -> ErrorData {
     ErrorData::internal_error(format!("{what} failed on the server (see its log)"), None)
 }
 
+/// The access decision of the HTTP request carrying this tool call (set by
+/// `access::layer`); missing counts as read-only.
+fn access(parts: &Parts) -> Access {
+    parts.extensions.get::<Access>().copied().unwrap_or(Access {
+        client: None,
+        write: false,
+    })
+}
+
+fn require_write(parts: &Parts) -> Result<Access, ErrorData> {
+    let a = access(parts);
+    if a.write {
+        Ok(a)
+    } else {
+        tracing::debug!(client = %a, "mcp write refused: read-only client");
+        Err(err(READ_ONLY_MSG))
+    }
+}
+
 fn json_result(v: serde_json::Value) -> CallToolResult {
     CallToolResult::success(vec![ContentBlock::text(
         serde_json::to_string_pretty(&v).unwrap_or_default(),
@@ -149,12 +169,15 @@ impl FileShareMcp {
         description = "Create a new share from one or more files and return its URL, \
 expiry and delete_token. The link is temporary: it stops working at expires_at, so tell the \
 user when it expires. HTML renders inline; relative links between files of the share work. \
-Content passes through your context: use the HTTP API (curl) for large files."
+Content passes through your context: use the HTTP API (curl) for large files. \
+Refused for clients outside the server's WRITE_ALLOWED_NETS (read-only access)."
     )]
     async fn create_share(
         &self,
+        Extension(parts): Extension<Parts>,
         Parameters(args): Parameters<CreateShareArgs>,
     ) -> Result<CallToolResult, ErrorData> {
+        let client = require_write(&parts)?;
         let cfg = &self.state.cfg;
         if cfg.upload_token.is_some() && cfg.mcp_api_key.is_none() {
             // Don't let an open /mcp bypass a protected upload API.
@@ -201,7 +224,7 @@ Content passes through your context: use the HTTP API (curl) for large files."
             UploadError::Io(io) => internal("create_share storage", io),
             other => err(other.to_string()),
         })?;
-        tracing::info!(token = %&created.token[..6], files = created.files.len(), "share created via MCP");
+        tracing::info!(token = %&created.token[..6], files = created.files.len(), client = %client, "share created via MCP");
         let r = build_response(cfg, &created);
         Ok(json_result(serde_json::to_value(&r).unwrap_or_default()))
     }
@@ -300,8 +323,10 @@ content, anything else as a base64 resource. Size-capped by the server (MCP_MAX_
     #[tool(description = "Delete a share immediately (needs the delete_token from create_share).")]
     async fn delete_share(
         &self,
+        Extension(parts): Extension<Parts>,
         Parameters(args): Parameters<DeleteArgs>,
     ) -> Result<CallToolResult, ErrorData> {
+        require_write(&parts)?;
         let (token, _) =
             parse_share_ref(&args.share).ok_or_else(|| err("not a share URL or token"))?;
         match self.state.store.delete(&token, args.delete_token.trim()) {

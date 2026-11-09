@@ -1,6 +1,7 @@
 //! fileshare -- anonymous, expiring file shares behind unguessable URLs,
 //! with an MCP endpoint. See README.md.
 
+mod access;
 #[cfg(test)]
 mod http_tests;
 mod mcp;
@@ -51,6 +52,10 @@ pub struct Config {
     pub upload_token: Option<String>,
     pub mcp_api_key: Option<String>,
     pub mcp_allowed_hosts: Vec<String>,
+    /// Clients allowed to upload/delete; empty = everyone.
+    pub write_nets: Vec<access::Net>,
+    /// Peers whose `X-Forwarded-For` is believed.
+    pub trusted_proxies: Vec<access::Net>,
     pub mcp_max_read: u64,
     pub mcp_max_body: usize,
     pub sweep_interval: Duration,
@@ -134,6 +139,14 @@ impl Config {
                         .collect()
                 })
                 .unwrap_or_default(),
+            write_nets: access::parse_nets(
+                "WRITE_ALLOWED_NETS",
+                var("WRITE_ALLOWED_NETS").as_deref(),
+            )?,
+            trusted_proxies: access::parse_nets(
+                "TRUSTED_PROXIES",
+                var("TRUSTED_PROXIES").as_deref(),
+            )?,
             mcp_max_read: num("MCP_MAX_READ", 5 << 20)?,
             mcp_max_body: num("MCP_MAX_BODY", 32 << 20)? as usize,
             sweep_interval: dur("SWEEP_INTERVAL", "5m")?,
@@ -260,6 +273,7 @@ pub fn app(state: Shared) -> Router {
         .merge(serve::routes(state.clone()))
         .merge(mcp::routes(state.clone()))
         .layer(middleware::from_fn_with_state(state.clone(), host_guard))
+        .layer(middleware::from_fn_with_state(state.clone(), access::layer))
         .layer(tower_http::trace::TraceLayer::new_for_http())
 }
 
@@ -356,6 +370,31 @@ async fn main() {
     if cfg.mcp_api_key.is_none() {
         tracing::info!("MCP_API_KEY unset: /mcp is unauthenticated");
     }
+    let list = |n: &[access::Net]| {
+        n.iter()
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    if cfg.write_nets.is_empty() {
+        tracing::info!("WRITE_ALLOWED_NETS unset: every client may upload and delete");
+    } else {
+        tracing::info!(
+            "uploads/deletes only from {}; other clients are read-only",
+            list(&cfg.write_nets)
+        );
+        if cfg.trusted_proxies.is_empty() {
+            tracing::info!(
+                "TRUSTED_PROXIES unset: X-Forwarded-For is ignored, the TCP peer is the client \
+                 (behind a reverse proxy, set TRUSTED_PROXIES to its address)"
+            );
+        } else {
+            tracing::info!(
+                "X-Forwarded-For trusted from {}",
+                list(&cfg.trusted_proxies)
+            );
+        }
+    }
     tracing::info!(
         "fileshare {} listening on {} (app {}, content {})",
         env!("CARGO_PKG_VERSION"),
@@ -390,18 +429,20 @@ async fn main() {
             std::process::exit(1);
         });
     let app = app(state);
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async {
-            let mut term =
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                    .expect("SIGTERM handler");
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {},
-                _ = term.recv() => {},
-            }
-        })
-        .await
-        .expect("server error");
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async {
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {},
+            _ = term.recv() => {},
+        }
+    })
+    .await
+    .expect("server error");
 }
 
 #[cfg(test)]

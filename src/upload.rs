@@ -8,7 +8,7 @@ use std::{
 use axum::{
     Json, Router,
     body::{Body, Bytes},
-    extract::{DefaultBodyLimit, Path, Query, State},
+    extract::{DefaultBodyLimit, Extension, Path, Query, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{Html, IntoResponse, Response},
     routing::{delete, get, post, put},
@@ -19,6 +19,7 @@ use tokio::{io::AsyncWriteExt, sync::OwnedSemaphorePermit};
 
 use crate::{
     Config, Shared,
+    access::Access,
     store::{Created, DeleteError, Staging, UploadError, sanitize_path},
 };
 
@@ -344,6 +345,7 @@ fn respond(cfg: &Config, c: &Created, text: bool) -> Response {
 /// for just the URL.
 async fn upload_multipart(
     State(state): State<Shared>,
+    Extension(access): Extension<Access>,
     Query(q): Query<UploadQuery>,
     headers: HeaderMap,
     body: Body,
@@ -450,7 +452,7 @@ async fn upload_multipart(
     };
     match finish(&state, st, unpack, ttl).await {
         Ok(c) => {
-            tracing::info!(token = %&c.token[..6], files = c.files.len(), "share created");
+            tracing::info!(token = %&c.token[..6], files = c.files.len(), client = %access, "share created");
             respond(&state.cfg, &c, q.format.as_deref() == Some("text"))
         }
         Err(e) => upload_error(e),
@@ -461,6 +463,7 @@ async fn upload_multipart(
 /// Replies with just the URL unless `?format=json`.
 async fn upload_put(
     State(state): State<Shared>,
+    Extension(access): Extension<Access>,
     Path(name): Path<String>,
     Query(q): Query<UploadQuery>,
     headers: HeaderMap,
@@ -514,7 +517,7 @@ async fn upload_put(
     let unpack = q.unpack.as_deref().and_then(parse_bool);
     match finish(&state, st, unpack, ttl).await {
         Ok(c) => {
-            tracing::info!(token = %&c.token[..6], files = c.files.len(), "share created");
+            tracing::info!(token = %&c.token[..6], files = c.files.len(), client = %access, "share created");
             respond(&state.cfg, &c, q.format.as_deref() != Some("json"))
         }
         Err(e) => upload_error(e),
@@ -539,9 +542,10 @@ async fn delete_share(
     }
 }
 
-async fn index(State(state): State<Shared>) -> Html<String> {
+async fn index(State(state): State<Shared>, Extension(access): Extension<Access>) -> Html<String> {
     let cfg = &state.cfg;
     let conf = serde_json::json!({
+        "uploadAllowed": access.write,
         "tokenRequired": cfg.upload_token.is_some(),
         "defaultExpiry": cfg.default_expiry.as_secs(),
         "maxExpiry": cfg.max_expiry.as_secs(),

@@ -35,6 +35,8 @@ pub fn state_with(dir: &std::path::Path, tweak: impl FnOnce(&mut Config)) -> Sha
         upload_token: None,
         mcp_api_key: None,
         mcp_allowed_hosts: vec![],
+        write_nets: vec![],
+        trusted_proxies: vec![],
         mcp_max_read: 1 << 20,
         mcp_max_body: 1 << 20,
         sweep_interval: Duration::from_secs(60),
@@ -852,4 +854,206 @@ async fn mcp_storage_errors_are_generic() {
     let text = r.to_string();
     assert!(text.contains("failed on the server"), "{r}");
     assert!(!text.contains("os error"), "{r}");
+}
+
+// ------------------------------------------- network-based write access
+
+const PROXY: &str = "172.20.0.2";
+
+/// `app()` with internal = 10.0.0.0/8 and a trusted proxy at `PROXY`.
+fn app_with_nets(dir: &std::path::Path) -> Router {
+    app_with(dir, "10.0.0.0/8", PROXY)
+}
+
+/// `app()` with the given WRITE_ALLOWED_NETS / TRUSTED_PROXIES. The TCP peer
+/// address comes from the test-only `x-test-peer` header (what
+/// `into_make_service_with_connect_info` provides in production).
+fn app_with(dir: &std::path::Path, write: &'static str, trusted: &'static str) -> Router {
+    let st = state_with(dir, |c| {
+        c.write_nets = crate::access::parse_nets("W", Some(write)).unwrap();
+        c.trusted_proxies = crate::access::parse_nets("T", Some(trusted)).unwrap();
+    });
+    app(st).layer(axum::middleware::map_request(
+        |mut req: Request<Body>| async move {
+            let peer = req
+                .headers()
+                .get("x-test-peer")
+                .map(|v| v.to_str().unwrap().parse::<std::net::IpAddr>().unwrap());
+            if let Some(ip) = peer {
+                req.extensions_mut()
+                    .insert(axum::extract::ConnectInfo(std::net::SocketAddr::new(
+                        ip, 4711,
+                    )));
+            }
+            req
+        },
+    ))
+}
+
+fn from(mut r: Request<Body>, peer: &str, xff: Option<&str>) -> Request<Body> {
+    r.headers_mut().insert("x-test-peer", peer.parse().unwrap());
+    if let Some(x) = xff {
+        r.headers_mut()
+            .insert("x-forwarded-for", x.parse().unwrap());
+    }
+    r
+}
+
+#[tokio::test]
+async fn writes_only_from_allowed_nets() {
+    let tmp = tempfile::tempdir().unwrap();
+    let app = app_with_nets(tmp.path());
+
+    // internal, directly and via the trusted proxy
+    let r = send(&app, from(put("a.txt", "", b"hi"), "10.1.2.3", None)).await;
+    assert_eq!(r.status(), StatusCode::OK);
+    let delete_token = r.headers()["x-delete-token"].to_str().unwrap().to_string();
+    let url = body_string(r).await.trim().to_string();
+    let token = url.split('/').nth(4).unwrap().to_string();
+    let r = send(&app, from(put("b.txt", "", b"hi"), PROXY, Some("10.4.5.6"))).await;
+    assert_eq!(r.status(), StatusCode::OK);
+
+    // external: direct, via the proxy, forged header from an untrusted peer,
+    // forged entry left of the real client, unknown peer
+    for (peer, xff) in [
+        (Some("203.0.113.7"), None),
+        (Some(PROXY), Some("203.0.113.7")),
+        (Some("203.0.113.7"), Some("10.1.2.3")),
+        (Some(PROXY), Some("10.1.2.3, 203.0.113.7")),
+        (None, None),
+    ] {
+        let mut req = put("c.txt", "", b"x");
+        if let Some(p) = peer {
+            req = from(req, p, xff);
+        }
+        let r = send(&app, req).await;
+        assert_eq!(r.status(), StatusCode::FORBIDDEN, "{peer:?} {xff:?}");
+        let r = send(
+            &app,
+            from(
+                post_multipart(multipart(&[("file", Some("a"), b"x")]), None),
+                peer.unwrap_or("203.0.113.7"),
+                xff,
+            ),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
+    }
+
+    // external delete is refused even with the right delete token
+    let del = |peer| {
+        from(
+            Request::delete(format!("/api/share/{token}"))
+                .header(header::HOST, APP)
+                .header("x-delete-token", &delete_token)
+                .body(Body::empty())
+                .unwrap(),
+            peer,
+            None,
+        )
+    };
+    assert_eq!(
+        send(&app, del("203.0.113.7")).await.status(),
+        StatusCode::FORBIDDEN
+    );
+
+    // ... but reading works from anywhere
+    let r = send(
+        &app,
+        from(get(CONTENT, &content_path(&url)), "203.0.113.7", None),
+    )
+    .await;
+    assert_eq!(body_string(r).await, "hi");
+
+    assert_eq!(send(&app, del("10.1.2.3")).await.status(), StatusCode::OK);
+
+    // the upload page tells read-only clients up front
+    let page = |peer| {
+        let app = app.clone();
+        async move { body_string(send(&app, from(get(APP, "/"), peer, None)).await).await }
+    };
+    assert!(page("10.1.2.3").await.contains("\"uploadAllowed\":true"));
+    assert!(
+        page("203.0.113.7")
+            .await
+            .contains("\"uploadAllowed\":false")
+    );
+}
+
+#[tokio::test]
+async fn mcp_is_read_only_outside_allowed_nets() {
+    let tmp = tempfile::tempdir().unwrap();
+    let app = app_with_nets(tmp.path());
+    let file = json!({"files": [{"path": "a.txt", "text": "hello"}]});
+
+    let mut inside = Mcp::new(
+        &app,
+        &[("x-test-peer", PROXY), ("x-forwarded-for", "10.0.0.5")],
+    );
+    inside.init().await;
+    let created = tool_json(&inside.call("create_share", file.clone()).await);
+    let share_url = created["share_url"].as_str().unwrap();
+
+    let mut outside = Mcp::new(&app, &[("x-test-peer", "203.0.113.7")]);
+    outside.init().await;
+    let r = outside.call("create_share", file).await;
+    let refused = r.get("error").is_some() || r["result"]["isError"] == true;
+    assert!(refused && r.to_string().contains("read-only"), "{r}");
+    let r = outside
+        .call(
+            "delete_share",
+            json!({"share": share_url, "delete_token": created["delete_token"]}),
+        )
+        .await;
+    assert!(r.to_string().contains("read-only"), "{r}");
+
+    // read tools stay available
+    let listed = tool_json(
+        &outside
+            .call("list_share", json!({"share": share_url}))
+            .await,
+    );
+    assert_eq!(listed["files"][0]["path"], "a.txt");
+    let r = outside.call("read_file", json!({"url": share_url})).await;
+    assert_eq!(r["result"]["content"][0]["resource"]["text"], "hello");
+}
+
+#[tokio::test]
+async fn ipv6_clients_and_proxies() {
+    let tmp = tempfile::tempdir().unwrap();
+    // dual-stack LAN (IPv4 written in mapped form), IPv6 proxy
+    let app = app_with(
+        tmp.path(),
+        "::ffff:192.168.10.0/120, 2001:db8:abcd::/56",
+        "fd00:20::2",
+    );
+    let status = |peer: &'static str, xff: Option<&'static str>| {
+        let app = app.clone();
+        async move {
+            send(&app, from(put("a.txt", "", b"x"), peer, xff))
+                .await
+                .status()
+        }
+    };
+    let ok = StatusCode::OK;
+    let no = StatusCode::FORBIDDEN;
+
+    // direct IPv6 peers
+    assert_eq!(status("2001:db8:abcd:42::1", None).await, ok);
+    assert_eq!(status("2001:db8:abce::1", None).await, no);
+    // IPv4 client on a dual-stack socket (BIND=[::]:8080), and plain IPv4
+    assert_eq!(status("::ffff:192.168.10.7", None).await, ok);
+    assert_eq!(status("192.168.10.7", None).await, ok);
+    assert_eq!(status("192.168.11.7", None).await, no);
+    // via the IPv6 proxy: IPv6 and IPv4 clients, bracketed with port
+    assert_eq!(status("fd00:20::2", Some("2001:db8:abcd:ff::9")).await, ok);
+    assert_eq!(
+        status("fd00:20::2", Some("[2001:db8:abcd::9]:51000")).await,
+        ok
+    );
+    assert_eq!(status("fd00:20::2", Some("192.168.10.7")).await, ok);
+    assert_eq!(status("fd00:20::2", Some("2001:db8:1::9")).await, no);
+    // forged header from an untrusted IPv6 peer, zone id where the client is
+    assert_eq!(status("2001:db8:1::9", Some("2001:db8:abcd::1")).await, no);
+    assert_eq!(status("fd00:20::2", Some("fe80::1%eth0")).await, no);
 }
