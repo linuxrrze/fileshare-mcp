@@ -39,7 +39,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # The image version is the crate version: bump `version` in
       # Cargo.toml for a release; a rebuild re-publishes the same
