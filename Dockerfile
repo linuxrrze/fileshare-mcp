@@ -2,7 +2,7 @@
 #
 # Everything lives in the binary: the HEALTHCHECK client (`fileshare
 # healthcheck`) and the startup banner -- with the label below,
-# .gitea/scripts/add-banner.sh only adds the rendered banner text, which the
+# .github/scripts/add-banner.sh only adds the rendered banner text, which the
 # binary prints on start (there is no shell for the usual wrapper).
 
 FROM rust:1.99-alpine AS build

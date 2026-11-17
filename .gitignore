@@ -1,2 +1,6 @@
 # Cargo build output
 /target/
+# Local, site-specific copies of the committed samples (may hold real
+# UPLOAD_TOKEN / MCP_API_KEY) -- never commit them.
+/.env
+/docker-compose.yml

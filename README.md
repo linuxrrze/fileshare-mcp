@@ -1,8 +1,9 @@
-# fileshare
+# fileshare-mcp
 
 Anonymous, temporary file sharing behind unguessable URLs. It's a single
 static Rust binary with an upload page, a curl-friendly HTTP API and an MCP
-endpoint for agents.
+endpoint for agents. Image: `ghcr.io/linuxrrze/fileshare-mcp`, built by
+[`.github/workflows/build.yml`](.github/workflows/build.yml).
 
 - **Anonymous upload** (optionally gated by `UPLOAD_TOKEN`).
 - **Unguessable links.** Each share gets a 128-bit random token,
@@ -386,11 +387,13 @@ PUBLIC_URL=http://app.localhost:8080 CONTENT_URL=http://content.localhost:8080 \
 | `.fileshare-base-digest` | yes | Registry digest of the `rust:alpine` build image the last build used. With a scratch final stage, that's the only base. A new digest means a new toolchain and musl, which are linked into the binary. Updated automatically by CI. |
 | `.env.sample` | no | Runtime settings template. Real tokens go only in the local, gitignored `.env`. |
 | `docker-compose.yml.sample` | no | Template for the gitignored `docker-compose.yml`. |
+| `.github/workflows/build.yml`, `.github/scripts/` | yes | The CI pipeline and its helpers: base-image digest lookup, startup banner, pinned Trivy scan. |
 
 ## Build & version tracking
 
-`.gitea/workflows/fileshare-rebuild.yml` is the repo's first workflow that
-builds source living in this repo (Flavor 2 plus the base-digest check).
+[`.github/workflows/build.yml`](.github/workflows/build.yml) builds the
+image from this repo's source and pushes it to
+`ghcr.io/linuxrrze/fileshare-mcp` with the workflow's `GITHUB_TOKEN`.
 
 - **Triggers:** a push touching `src/`, `Cargo.*`, `Dockerfile` or the
   workflow rebuilds. A daily check rebuilds only when the `rust:alpine` build image is

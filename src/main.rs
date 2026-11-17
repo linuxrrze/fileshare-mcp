@@ -278,7 +278,7 @@ pub fn app(state: Shared) -> Router {
 }
 
 /// Startup banner (image name + version), rendered by CI and added to the
-/// image by .gitea/scripts/add-banner.sh. The image is FROM scratch, so there
+/// image by .github/scripts/add-banner.sh. The image is FROM scratch, so there
 /// is no shell for the usual wrapper: the Dockerfile opts into the built-in
 /// mode (`LABEL de.linux-ng.image-banner=builtin`) and the binary prints the
 /// file itself. Absent outside the CI-built image (cargo run, tests).

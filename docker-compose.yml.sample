@@ -14,7 +14,7 @@
 
 services:
   fileshare:
-    image: git.linux-ng.de/marcel/fileshare:latest
+    image: ghcr.io/linuxrrze/fileshare-mcp:latest
     container_name: fileshare
     restart: unless-stopped
     # .env must exist locally: cp .env.sample .env
