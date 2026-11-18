@@ -108,7 +108,7 @@ page loads.
 ```sh
 claude mcp add --transport http fileshare https://share.example.de/mcp \
   --header "Authorization: Bearer <MCP_API_KEY>"     # omit if MCP_API_KEY is empty
-# from a container on codingenv's network (MCP_ALLOWED_HOSTS=fileshare):
+# from a container on agent-env's network (MCP_ALLOWED_HOSTS=fileshare):
 claude mcp add --transport http fileshare http://fileshare:8080/mcp
 ```
 | Tool | Does |
@@ -171,7 +171,7 @@ published port. Traefik and nginx (`proxy_set_header X-Forwarded-For
 $proxy_add_x_forwarded_for;`) both send the header.
 
 Example: LAN and VPN may write, Traefik has the fixed address 172.30.0.2,
-and agent containers on codingenv's network (172.31.0.0/24) may write too:
+and agent containers on agent-env's network (172.31.0.0/24) may write too:
 
 ```sh
 WRITE_ALLOWED_NETS=192.168.10.0/24,10.8.0.0/24,172.31.0.0/24

@@ -65,13 +65,13 @@ services:
     mem_limit: 512m
     # Threads count as pids (tokio's blocking pool can grow to 512).
     pids_limit: 1024
-    # Uncomment to let containers on codingenv's network use
+    # Uncomment to let containers on agent-env's network use
     # http://fileshare:8080/mcp (keep MCP_ALLOWED_HOSTS=fileshare in .env).
     # networks:
     #   - default
-    #   - codingenv
+    #   - agent-env
 
 # networks:
-#   codingenv:
+#   agent-env:
 #     external: true
-#     name: ${CODINGENV_NETWORK:-codingenv_default}
+#     name: ${CODINGENV_NETWORK:-agent-env_default}
